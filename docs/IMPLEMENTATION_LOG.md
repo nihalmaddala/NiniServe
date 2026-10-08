@@ -3,6 +3,13 @@
 This log records verified work, command outcomes, blockers, and the next scoped
 task. It is not a roadmap completion claim.
 
+## 2026-10-08 — CI checkout runtime follow-up
+
+The first post-merge CI run passed but warned that `actions/checkout@v4`
+targeted deprecated Node.js 20. Updated checkout to the immutable commit for
+official release v7.0.1 (`3d3c42e5aac5ba805825da76410c181273ba90b1`),
+which uses the current action runtime. This follow-up changes no Rust behavior.
+
 ## 2026-10-08 — Issue #2 implementation plan
 
 ### Phase and scope
