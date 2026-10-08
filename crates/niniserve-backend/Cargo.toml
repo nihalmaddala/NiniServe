@@ -1,0 +1,12 @@
+[package]
+name = "niniserve-backend"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+niniserve-protocol = { path = "../niniserve-protocol" }
+
+[lints]
+workspace = true
+
