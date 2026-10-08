@@ -5,6 +5,7 @@
 # Local model artifacts
 /models/*
 !/models/.gitkeep
+!/models/README.md
 *.gguf
 *.ggml
 
@@ -22,4 +23,3 @@
 .vscode/
 *.swp
 *.swo
-

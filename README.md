@@ -52,6 +52,8 @@ The current development platform is macOS on Apple Silicon with:
   backend tests
 
 Model files are local test inputs and must not be committed.
+See [`models/README.md`](models/README.md) for the pinned Phase 0 test fixture,
+download command, license source, and checksum verification.
 
 ### Install the toolchain
 

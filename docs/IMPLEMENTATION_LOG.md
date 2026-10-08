@@ -3,6 +3,33 @@
 This log records verified work, command outcomes, blockers, and the next scoped
 task. It is not a roadmap completion claim.
 
+## 2026-10-08 — Local GGUF fixture setup
+
+Downloaded the official Apache-2.0 Qwen2.5-0.5B-Instruct Q4_K_M GGUF to the
+Git-ignored `models/` directory from pinned Hugging Face revision
+`9217f5db79a29953eb74d5343926648285ec7e67`.
+
+```text
+File size
+PASS — 491400032 bytes, matching official metadata.
+
+SHA-256
+PASS — 74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db,
+matching the official LFS digest.
+
+File header
+PASS — first four bytes are GGUF.
+
+Git exclusion
+PASS — .gitignore excludes the model weight.
+
+Real inference
+NOT RUN — the llama.cpp adapter has not been selected or implemented yet.
+```
+
+Added `models/README.md` with a reproducible pinned download and checksum
+command. No model weight is committed.
+
 ## 2026-10-08 — CI checkout runtime follow-up
 
 The first post-merge CI run passed but warned that `actions/checkout@v4`
