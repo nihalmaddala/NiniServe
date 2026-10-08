@@ -3,6 +3,92 @@
 This log records verified work, command outcomes, blockers, and the next scoped
 task. It is not a roadmap completion claim.
 
+## 2026-10-08 — Issue #2 implementation plan
+
+### Phase and scope
+
+Phase 0 repository/toolchain foundation on
+`chore/rust-toolchain-workspace`.
+
+1. Pin the installed Rust 1.97.1 toolchain with `rustfmt` and `clippy`.
+2. Create two non-empty crates: model-independent protocol types and a backend
+   execution contract with deterministic mock behavior.
+3. Test request validation, batch limits, sequence isolation, token positions,
+   deterministic output, and cleanup.
+4. Add CI that runs the same formatting, linting, and test commands used
+   locally.
+5. Keep the real llama.cpp adapter and HTTP serving out of this change; record
+   the GGUF-dependent feasibility gate as blocked.
+
+### Installed and pinned toolchain
+
+| Item | Verified version |
+| --- | --- |
+| rustup | 1.29.1 |
+| Rust compiler | 1.97.1 (`aarch64-apple-darwin`) |
+| Cargo | 1.97.1 |
+| rustfmt | 1.9.0-stable |
+| Clippy | 0.1.97 |
+| CMake | 4.4.4 |
+| Clang | Apple Clang 17.0.0 |
+
+Homebrew installed `rustup` and `cmake`. The exact Rust 1.97.1 toolchain was
+installed with the minimal profile plus `rustfmt` and `clippy` and is pinned in
+`rust-toolchain.toml`.
+
+### Implemented
+
+- Added a Cargo workspace with `niniserve-protocol` and
+  `niniserve-backend`.
+- Added typed request and sequence IDs, pre-tokenization request validation,
+  and explicit lifecycle transitions.
+- Added a synchronous model-executor contract whose output owns sampled token
+  data rather than exposing backend logit pointers.
+- Added a deterministic mock executor with bounded batch/sequence capacity,
+  explicit positions, per-sequence output routing, atomic validation, trace
+  capture, and sequence cleanup.
+- Added macOS CI using the same pinned toolchain and local quality gates.
+- Added `docs/BACKEND_DECISION.md`, explicitly separating verified mock behavior
+  from the unverified real llama.cpp adapter.
+
+### Verification results
+
+```text
+cargo fmt --all -- --check
+PASS — all workspace Rust sources match rustfmt 1.9.0-stable.
+
+cargo clippy --workspace --all-targets -- -D warnings
+PASS — both crates compile with no Clippy or compiler warnings.
+
+cargo test --workspace
+PASS — 9 unit tests passed; 0 failed; doc tests passed (0 tests).
+
+git diff --check
+PASS — no whitespace errors.
+
+Real GGUF validation
+BLOCKED — no compatible local model has been provided or found.
+```
+
+The first formatting check correctly failed on unformatted new sources; running
+`cargo fmt --all` resolved it before the recorded passing gate above.
+
+### Current limitations
+
+- The mock tokenizer and sampled-token formula are deterministic test fixtures,
+  not model behavior and not performance evidence.
+- No llama.cpp version or Rust binding API has been selected or verified.
+- The workspace does not yet contain an engine worker, HTTP server, scheduler,
+  or native model adapter.
+
+### Next task
+
+Open a focused backend-spike issue and branch: inspect versioned
+`llama-cpp-2`/llama.cpp source, select an exact dependency only after compiling
+a minimal API probe, and obtain a compatible local GGUF for the two-sequence
+feasibility test. If a model remains unavailable, record the real test as
+BLOCKED and do not claim continuous batching.
+
 ## 2026-10-08 — Repository foundation and Phase 0 audit
 
 ### Scope
@@ -76,4 +162,3 @@ BLOCKED — no local model found within the repository.
 Create `chore/rust-toolchain-workspace`: select and pin a stable Rust toolchain,
 install/verify CMake, create the smallest compiling workspace with a meaningful
 mock backend boundary, add CI, and record exact formatting/lint/test results.
-
