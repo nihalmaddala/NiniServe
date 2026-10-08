@@ -11,10 +11,11 @@ time-to-first-token, inter-token latency, throughput, and fairness.
 
 ## Project status
 
-NiniServe is at the start of **Phase 0: repository and backend feasibility**.
-The engineering specification is present, but there is not yet a runnable
-server or a verified llama.cpp integration. No inference or performance claims
-have been established.
+NiniServe is in **Phase 0: repository and backend feasibility**. The repository
+contains a compiling Rust workspace with model-independent protocol types and a
+deterministic mock backend for validating sequence positions, routing, limits,
+and cleanup. There is not yet a runnable server or a verified llama.cpp
+integration. No real inference or performance claims have been established.
 
 The canonical requirements and phase gates are in
 [`NINISERVE_MASTER_SPEC.md`](NINISERVE_MASTER_SPEC.md). Coding agents must also
@@ -42,17 +43,55 @@ commit style, pull-request expectations, and local verification commands.
 
 ## Local prerequisites
 
-The intended development platform is macOS on Apple Silicon with:
+The current development platform is macOS on Apple Silicon with:
 
-- Xcode Command Line Tools / Clang
-- CMake
-- a pinned stable Rust toolchain (to be selected in the toolchain setup PR)
+- Apple Clang 17
+- CMake 4.4.4
+- Rust 1.97.1 with rustfmt and Clippy, pinned by `rust-toolchain.toml`
 - a user-supplied, appropriately licensed decoder-only GGUF model for real
   backend tests
 
-Model files are local test inputs and must not be committed. Until the backend
-spike lands, setup and run commands would be speculative and are deliberately
-not documented as working commands.
+Model files are local test inputs and must not be committed.
+
+### Install the toolchain
+
+On Apple Silicon with Homebrew:
+
+```bash
+brew install rustup cmake
+brew link --force rustup
+rustup toolchain install 1.97.1 --profile minimal --component rustfmt,clippy
+```
+
+The repository's `rust-toolchain.toml` selects the pinned toolchain
+automatically. Confirm the native build tools with:
+
+```bash
+rustc --version
+cargo --version
+cmake --version
+clang --version
+```
+
+## Build and test
+
+From the repository root:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+The workspace currently contains:
+
+- `niniserve-protocol`: typed request/sequence IDs, request validation, and
+  lifecycle transitions;
+- `niniserve-backend`: the synchronous executor contract and deterministic mock
+  implementation.
+
+See [`docs/BACKEND_DECISION.md`](docs/BACKEND_DECISION.md) for the boundary
+between verified mock behavior and the still-blocked real backend spike.
 
 ## Scope boundary
 
@@ -61,4 +100,3 @@ will own tokenization, tensor execution, model-side KV storage, kernels, and
 the physical memory implementation. This project does not claim to implement
 paged attention, custom Metal kernels, or a production replacement for mature
 serving systems.
-
