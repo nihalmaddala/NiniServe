@@ -1,0 +1,39 @@
+name: Engineering specification
+description: Propose or refine an architectural decision, invariant, or phase gate.
+title: "spec: "
+labels: ["specification", "needs-design"]
+body:
+  - type: textarea
+    id: context
+    attributes:
+      label: Context and decision pressure
+      description: What uncertainty or constraint requires a written decision?
+    validations:
+      required: true
+  - type: textarea
+    id: decision
+    attributes:
+      label: Proposed decision
+      description: State the interface, invariant, or boundary precisely.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives and tradeoffs
+    validations:
+      required: true
+  - type: textarea
+    id: validation
+    attributes:
+      label: Validation plan
+      description: Identify the compile check, test, trace, or benchmark that resolves the uncertainty.
+    validations:
+      required: true
+  - type: textarea
+    id: consequences
+    attributes:
+      label: Consequences and follow-up work
+    validations:
+      required: true
+

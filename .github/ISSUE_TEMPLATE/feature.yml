@@ -1,0 +1,45 @@
+name: Feature request
+description: Propose a scoped capability that fits the current project phase.
+title: "feat: "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What concrete user or engineering problem should this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: Describe the smallest useful behavior and its interface.
+    validations:
+      required: true
+  - type: dropdown
+    id: phase
+    attributes:
+      label: Earliest applicable phase
+      options:
+        - Phase 0 — repository/backend spike
+        - Phase 1 — single-request serving
+        - Phase 2 — continuous batching
+        - Phase 3 — baseline schedulers/benchmarks
+        - Phase 4 — adaptive controller
+        - Phase 5 — robustness/polish
+        - Future investigation
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance evidence
+      description: What tests, traces, or measurements would prove this works?
+    validations:
+      required: true
+  - type: textarea
+    id: exclusions
+    attributes:
+      label: Out of scope
+
