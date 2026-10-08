@@ -1,0 +1,25 @@
+# Rust build output
+/target/
+*.profraw
+
+# Local model artifacts
+/models/*
+!/models/.gitkeep
+*.gguf
+*.ggml
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Benchmark output (commit only deliberately curated fixtures)
+/results/
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
