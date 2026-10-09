@@ -77,11 +77,12 @@ cargo clippy -p niniserve-backend --features llamacpp \
 PASS — native probe and adapter module.
 ```
 
-### Workflow blocker
+### GitHub workflow
 
-The requested GitHub issue, push, PR, CI wait, and merge remain blocked because
-the local `gh` credential is invalid, no browser surface is available, and the
-suggested GitHub connection has not been connected. No remote action is claimed.
+Created focused issue
+[#6](https://github.com/nihalmaddala/NiniServe/issues/6) with the Phase 0 scope
+and acceptance evidence. Push, PR, CI, and merge outcomes are recorded only
+after they occur.
 
 ### Next task
 
@@ -114,12 +115,13 @@ this gate.
    and this log with exact versions, commands, results, limitations, and the
    smallest Phase 1 follow-up.
 
-### Initial workflow blocker
+### Initial workflow note
 
-Creating the GitHub issue before branching is temporarily blocked: the local
-`gh` credential is invalid and no browser surface is available. The local branch
-was created so technical work can continue; issue/PR publication remains pending
-GitHub reconnection and will not be reported as completed unless verified.
+The first `gh auth status` check reported a stale credential and no browser
+surface was available, so the local branch was created before the issue. The
+later authenticated API call succeeded and created issue
+[#6](https://github.com/nihalmaddala/NiniServe/issues/6); no remote action is
+reported unless independently verified.
 
 ## 2026-10-08 — Local GGUF fixture setup
 
