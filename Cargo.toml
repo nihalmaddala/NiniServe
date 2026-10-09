@@ -1,7 +1,9 @@
 [workspace]
 members = [
     "crates/niniserve-backend",
+    "crates/niniserve-engine",
     "crates/niniserve-protocol",
+    "crates/niniserve-server",
 ]
 resolver = "3"
 
@@ -10,9 +12,15 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.97.1"
 
+[workspace.dependencies]
+axum = { version = "=0.8.9" }
+serde = { version = "=1.0.229" }
+tokio = { version = "=1.53.2" }
+tokio-stream = { version = "=0.1.19" }
+tower = { version = "=0.5.3" }
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
-

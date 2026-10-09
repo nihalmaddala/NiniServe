@@ -103,10 +103,13 @@ impl ModelExecutor for MockExecutor {
             candidate_positions.insert(token.sequence_id, next_position);
 
             if token.request_logits {
+                let sampled_token_id = Self::sampled_token(*token);
                 events.push(BackendTokenEvent {
                     sequence_id: token.sequence_id,
                     evaluated_position: token.position,
-                    sampled_token_id: Self::sampled_token(*token),
+                    sampled_token_id,
+                    text_bytes: format!("<{sampled_token_id}>").into_bytes(),
+                    is_eog: false,
                 });
             }
         }
@@ -183,6 +186,8 @@ mod tests {
         assert_eq!(events[1].sequence_id, SequenceId(20));
         assert_eq!(events[1].evaluated_position, 1);
         assert_ne!(events[0].sampled_token_id, events[1].sampled_token_id);
+        assert_eq!(events[0].text_bytes, b"<113>");
+        assert!(!events[0].is_eog);
         assert_eq!(executor.active_sequence_count(), 2);
         assert_eq!(executor.trace(), plan.tokens.as_slice());
     }

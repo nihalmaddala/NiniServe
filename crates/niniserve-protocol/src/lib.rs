@@ -21,6 +21,41 @@ pub struct GenerationRequest {
     pub seed: Option<u64>,
 }
 
+/// Why generation ended normally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinishReason {
+    Stop,
+    Length,
+}
+
+/// Model-independent events delivered from the engine to one request stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GenerationEvent {
+    Started {
+        request_id: RequestId,
+    },
+    Token {
+        request_id: RequestId,
+        token_id: u32,
+        text: String,
+    },
+    Completed {
+        request_id: RequestId,
+        finish_reason: FinishReason,
+    },
+    Error {
+        request_id: RequestId,
+        message: String,
+    },
+}
+
+impl GenerationEvent {
+    #[must_use]
+    pub const fn is_terminal(&self) -> bool {
+        matches!(self, Self::Completed { .. } | Self::Error { .. })
+    }
+}
+
 /// Server-enforced request bounds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestLimits {

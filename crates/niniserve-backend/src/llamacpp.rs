@@ -1,6 +1,11 @@
 //! Pinned llama.cpp feasibility probe.
 
-use std::{fmt, num::NonZeroU32, path::Path};
+use std::{
+    collections::HashMap,
+    fmt,
+    num::NonZeroU32,
+    path::{Path, PathBuf},
+};
 
 use llama_cpp_2::{
     context::params::LlamaContextParams,
@@ -10,6 +15,257 @@ use llama_cpp_2::{
     sampling::LlamaSampler,
     token::LlamaToken,
 };
+use niniserve_protocol::SequenceId;
+use self_cell::self_cell;
+
+use crate::{
+    BackendError, BackendLimits, BackendTokenEvent, ExecutionPlan, ModelExecutor, SamplingConfig,
+};
+
+type OwnedContext<'model> = llama_cpp_2::context::LlamaContext<'model>;
+
+self_cell!(
+    struct ModelContextCell {
+        owner: LlamaModel,
+
+        #[covariant]
+        dependent: OwnedContext,
+    }
+
+    impl {Debug}
+);
+
+#[derive(Debug, Clone)]
+pub struct LlamaCppConfig {
+    pub model_path: PathBuf,
+    pub n_ctx: u32,
+    pub n_batch: u32,
+    pub n_ubatch: u32,
+    pub n_seq_max: u32,
+    pub gpu_layers: u32,
+}
+
+impl LlamaCppConfig {
+    #[must_use]
+    pub fn single_request(model_path: impl Into<PathBuf>) -> Self {
+        Self {
+            model_path: model_path.into(),
+            n_ctx: 2_048,
+            n_batch: 512,
+            n_ubatch: 128,
+            n_seq_max: 1,
+            gpu_layers: u32::MAX,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct LlamaCppExecutor {
+    // Drop the self-referential model/context before shutting down the backend.
+    runtime: ModelContextCell,
+    _backend: LlamaBackend,
+    samplers: HashMap<SequenceId, LlamaSampler>,
+    limits: BackendLimits,
+    gpu_offload_supported: bool,
+}
+
+impl LlamaCppExecutor {
+    pub fn load(config: &LlamaCppConfig) -> Result<Self, BackendError> {
+        if config.n_ubatch > config.n_batch {
+            return Err(native_error("n_ubatch must not exceed n_batch"));
+        }
+        if config.n_seq_max == 0 {
+            return Err(native_error("n_seq_max must be positive"));
+        }
+        let backend = LlamaBackend::init()
+            .map_err(|error| native_operation("initialize llama backend", error))?;
+        let gpu_offload_supported = backend.supports_gpu_offload();
+        let model_params = LlamaModelParams::default().with_n_gpu_layers(config.gpu_layers);
+        let model = LlamaModel::load_from_file(&backend, &config.model_path, &model_params)
+            .map_err(|error| native_operation("load GGUF model", error))?;
+        let context_params = LlamaContextParams::default()
+            .with_n_ctx(NonZeroU32::new(config.n_ctx))
+            .with_n_batch(config.n_batch)
+            .with_n_ubatch(config.n_ubatch)
+            .with_n_seq_max(config.n_seq_max);
+        let runtime =
+            ModelContextCell::try_new(model, |model| model.new_context(&backend, context_params))
+                .map_err(|error| native_operation("create llama context", error))?;
+        let limits = BackendLimits {
+            max_batch_tokens: usize::try_from(runtime.borrow_dependent().n_batch())
+                .map_err(|error| native_operation("convert n_batch", error))?,
+            max_active_sequences: usize::try_from(config.n_seq_max)
+                .map_err(|error| native_operation("convert n_seq_max", error))?,
+        };
+        Ok(Self {
+            runtime,
+            _backend: backend,
+            samplers: HashMap::new(),
+            limits,
+            gpu_offload_supported,
+        })
+    }
+
+    #[must_use]
+    pub fn gpu_offload_supported(&self) -> bool {
+        self.gpu_offload_supported
+    }
+
+    #[must_use]
+    pub fn context_limits(&self) -> (u32, u32, u32) {
+        let context = self.runtime.borrow_dependent();
+        (context.n_ctx(), context.n_batch(), context.n_ubatch())
+    }
+}
+
+impl ModelExecutor for LlamaCppExecutor {
+    fn tokenize(&self, prompt: &str) -> Result<Vec<u32>, BackendError> {
+        if prompt.is_empty() {
+            return Err(BackendError::EmptyPrompt);
+        }
+        self.runtime
+            .borrow_owner()
+            .vocab()
+            .tokenize(prompt.as_bytes(), true, true)
+            .into_iter()
+            .map(|token| {
+                u32::try_from(token.0).map_err(|error| native_operation("convert token ID", error))
+            })
+            .collect()
+    }
+
+    fn start_sequence(
+        &mut self,
+        sequence_id: SequenceId,
+        sampling: SamplingConfig,
+    ) -> Result<(), BackendError> {
+        validate_sequence_slot(sequence_id, self.limits.max_active_sequences)?;
+        if self.samplers.contains_key(&sequence_id) {
+            return Err(native_error(format!(
+                "sequence {} already has sampler state",
+                sequence_id.0
+            )));
+        }
+        let sampler = if sampling.temperature == 0.0 {
+            LlamaSampler::greedy()
+        } else {
+            LlamaSampler::chain_simple([
+                LlamaSampler::top_p(sampling.top_p, 1),
+                LlamaSampler::temp(sampling.temperature),
+                LlamaSampler::dist(sampling.seed),
+            ])
+        };
+        self.samplers.insert(sequence_id, sampler);
+        Ok(())
+    }
+
+    fn execute(&mut self, plan: &ExecutionPlan) -> Result<Vec<BackendTokenEvent>, BackendError> {
+        if plan.tokens.is_empty() {
+            return Err(BackendError::EmptyPlan);
+        }
+        if plan.tokens.len() > self.limits.max_batch_tokens {
+            return Err(BackendError::BatchTooLarge {
+                actual: plan.tokens.len(),
+                maximum: self.limits.max_batch_tokens,
+            });
+        }
+
+        let mut batch = LlamaBatch::new(plan.tokens.len(), 1);
+        let mut requested = Vec::new();
+        for token in &plan.tokens {
+            validate_sequence_slot(token.sequence_id, self.limits.max_active_sequences)?;
+            if !self.samplers.contains_key(&token.sequence_id) {
+                return Err(BackendError::UnknownSequence(token.sequence_id));
+            }
+            let token_id = i32::try_from(token.token_id)
+                .map_err(|error| native_operation("convert token ID", error))?;
+            let position = i32::try_from(token.position)
+                .map_err(|error| native_operation("convert token position", error))?;
+            let sequence_id = i32::try_from(token.sequence_id.0)
+                .map_err(|error| native_operation("convert sequence ID", error))?;
+            let batch_index = batch.n_tokens();
+            batch
+                .add(
+                    LlamaToken(token_id),
+                    position,
+                    &[sequence_id],
+                    token.request_logits,
+                )
+                .map_err(|error| native_operation("add token to batch", error))?;
+            if token.request_logits {
+                requested.push((batch_index, *token));
+            }
+        }
+
+        let samplers = &mut self.samplers;
+        self.runtime.with_dependent_mut(|model, context| {
+            context
+                .decode(&mut batch)
+                .map_err(|error| native_operation("decode batch", error))?;
+            let vocab = model.vocab();
+            requested
+                .into_iter()
+                .map(|(batch_index, input)| {
+                    let sampler = samplers
+                        .get_mut(&input.sequence_id)
+                        .ok_or(BackendError::UnknownSequence(input.sequence_id))?;
+                    let sampled = sampler.sample(context, batch_index);
+                    let sampled_token_id = u32::try_from(sampled.0)
+                        .map_err(|error| native_operation("convert sampled token", error))?;
+                    Ok(BackendTokenEvent {
+                        sequence_id: input.sequence_id,
+                        evaluated_position: input.position,
+                        sampled_token_id,
+                        text_bytes: vocab.token_to_piece(sampled, true, None),
+                        is_eog: vocab.is_eog(sampled),
+                    })
+                })
+                .collect()
+        })
+    }
+
+    fn release_sequence(&mut self, sequence_id: SequenceId) -> Result<(), BackendError> {
+        let sequence_slot = validate_sequence_slot(sequence_id, self.limits.max_active_sequences)?;
+        if !self.samplers.contains_key(&sequence_id) {
+            return Err(BackendError::UnknownSequence(sequence_id));
+        }
+        self.runtime.with_dependent_mut(|_, context| {
+            context
+                .kv_cache_seq_rm(sequence_slot, None, None)
+                .map_err(|error| native_operation("remove sequence memory", error))?;
+            if context.kv_cache_seq_pos_max(sequence_slot) != -1 {
+                return Err(native_error(format!(
+                    "sequence {} memory remained after removal",
+                    sequence_id.0
+                )));
+            }
+            Ok(())
+        })?;
+        self.samplers.remove(&sequence_id);
+        Ok(())
+    }
+
+    fn limits(&self) -> BackendLimits {
+        self.limits
+    }
+}
+
+fn validate_sequence_slot(sequence_id: SequenceId, maximum: usize) -> Result<i32, BackendError> {
+    let slot = usize::try_from(sequence_id.0)
+        .map_err(|error| native_operation("convert sequence slot", error))?;
+    if slot >= maximum {
+        return Err(BackendError::TooManySequences { maximum });
+    }
+    i32::try_from(sequence_id.0).map_err(|error| native_operation("convert sequence slot", error))
+}
+
+fn native_operation(operation: &str, error: impl fmt::Display) -> BackendError {
+    native_error(format!("{operation}: {error}"))
+}
+
+fn native_error(message: impl Into<String>) -> BackendError {
+    BackendError::Native(message.into())
+}
 
 // With non-unified KV streams, llama.cpp requires sequence IDs to be dense in
 // `0..n_seq_max`; these are backend slots, not user-facing request IDs.

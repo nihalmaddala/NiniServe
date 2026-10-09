@@ -1,6 +1,7 @@
 # Backend decision record
 
-**Status:** Phase 0 feasibility gate passed on the supplied real GGUF.
+**Status:** Phase 0 feasibility gate and Phase 1 single-request serving gate
+passed on the supplied real GGUF.
 
 ## Decision
 
@@ -39,8 +40,40 @@ Apple M2 Metal.
   `kv_cache_seq_pos_max` checks returned `-1`.
 
 This passes the narrow Phase 0 multi-sequence feasibility gate. It does **not**
-claim a production adapter, an HTTP server, request concurrency, cancellation,
-continuous scheduling, or a performance improvement.
+claim request concurrency, cancellation, continuous scheduling, or a
+performance improvement.
+
+## Phase 1 adapter and serving evidence
+
+`LlamaCppExecutor` is the reusable, feature-gated adapter. A `self_cell` owner
+keeps `LlamaModel` and its borrowing `LlamaContext` together inside
+`niniserve-backend`; no backend type or unsafe code escapes into the engine or
+HTTP layer. The adapter implements:
+
+- model tokenization and owned token-piece bytes;
+- explicit token IDs, positions, dense backend sequence slots, and per-token
+  logits requests through `LlamaBatch::add`;
+- exact original batch-index sampling through `LlamaSampler::sample`;
+- one independent sampler chain per active sequence;
+- `LlamaVocab::is_eog` termination; and
+- verified whole-sequence KV removal before sampler state is discarded.
+
+The Phase 1 server loaded the ignored Qwen2.5 fixture on Apple M2, offloaded
+25/25 layers, and reported `n_ctx=2048`, `n_batch=512`, `n_ubatch=128`, and
+`n_seq_max=1`. A real request streamed 12 coherent text fragments (` Paris. It
+is the largest city in Europe and the second`), emitted a terminal
+`finish_reason: length`, and ended with `[DONE]`. A second sequential request
+then streamed eight fragments and `[DONE]`, proving the released backend slot
+was reusable. After warmup, that second local observation reached its first SSE
+event in 0.037 s and completed in 0.100 s (8 non-empty fragments; 126.708
+fragments/s after first event). This is one informal smoke observation, not a
+benchmark or a cross-system performance claim.
+
+The first graceful-shutdown attempt exposed a detached-worker teardown race
+and a llama.cpp Metal residency assertion. Engine handle ownership was changed
+so the final handle closes the bounded command channel and joins the engine
+thread before backend destruction. The repeated Ctrl-C shutdown then exited
+with status 0 after `ggml_metal_free: deallocating`.
 
 ## Adapter invariants discovered
 
@@ -67,8 +100,7 @@ above, and real-model output is not used as mock performance evidence.
 
 ## Next backend task
 
-In the smallest Phase 1 vertical slice, turn this proven surface into a
-single-request `ModelExecutor` implementation owned by one dedicated engine
-worker. Add bounded commands/events and an Axum SSE endpoint only after the
-adapter has explicit pending-token state, error recovery, and exactly-once
-sequence-slot cleanup.
+Phase 2 should add the smallest active-sequence registry and multi-request
+batch builder around this adapter, with explicit cancellation commands and
+batch traces. Do not begin scheduler-policy or adaptive-controller work until
+real concurrent request isolation and cleanup pass.
