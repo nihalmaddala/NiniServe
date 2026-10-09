@@ -8,6 +8,9 @@ mod mock;
 
 pub use mock::MockExecutor;
 
+#[cfg(feature = "llamacpp")]
+pub mod llamacpp;
+
 /// Conservative limits reported by a model executor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BackendLimits {
