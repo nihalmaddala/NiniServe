@@ -3,6 +3,126 @@
 This log records verified work, command outcomes, blockers, and the next scoped
 task. It is not a roadmap completion claim.
 
+## 2026-10-09 — Phase 0 real-backend feasibility result
+
+### Outcome
+
+PASS — the real two-sequence llama.cpp gate passed twice with deterministic
+per-sequence token IDs on the supplied Qwen2.5 GGUF and Apple M2 Metal. This is
+a backend feasibility result, not a claim that an engine, HTTP service, or
+continuous scheduler exists.
+
+### Implemented
+
+- Exactly pinned optional `llama-cpp-2 = 0.1.159`; matching sys crate is also
+  `0.1.159` and `Cargo.lock` records the complete native dependency graph.
+- Added a `llamacpp` feature and kept the mock-only default build unchanged.
+- Added the backend-contained real probe and `examples/two_sequences.rs`.
+- Added primary-source API research in `docs/BACKEND_API_RESEARCH.md` and
+  finalized the Phase 0 decision in `docs/BACKEND_DECISION.md`.
+
+### Exact source mapping and APIs
+
+```text
+llama-cpp-2 / llama-cpp-sys-2: 0.1.159
+wrapper commit: 3cfdd729d65e35da407e5f820edf73201bfa54f6
+vendored llama.cpp commit: 26394b4e6749a41c3633db040e0987500a5f7013
+
+LlamaBatch::new; LlamaBatch::add; LlamaBatch::clear
+LlamaContext::decode; get_logits_ith (via LlamaSampler::sample)
+LlamaSampler::{chain_simple, top_k, temp, dist}
+LlamaVocab::{tokenize, is_eog, detokenize}
+LlamaContext::{kv_cache_seq_rm, kv_cache_seq_pos_max}
+LlamaContext::{n_ctx, n_batch, n_ubatch}
+LlamaContextParams::{with_n_ctx, with_n_batch, with_n_ubatch, with_n_seq_max}
+```
+
+### Real commands and evidence
+
+```text
+cargo check -p niniserve-backend --features llamacpp --example two_sequences
+PASS — Rust and vendored native sources compiled on aarch64 macOS.
+
+target/debug/examples/two_sequences \
+  models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+PASS twice outside the restricted sandbox — Apple M2 Metal, 25/25 layers
+offloaded, n_ctx=1024, n_ctx_seq=512, n_batch=512, n_ubatch=128.
+
+Prefill batch 0: both sequence IDs with explicit positions.
+Decode batches 1..11: both sequence IDs present in every batch.
+Generated: 12 tokens per sequence using separate fixed-seed sampler chains.
+Cleanup: PASS for both sequences; post-removal max position was -1.
+Repeat: PASS; both 12-token ID vectors exactly matched the first run.
+```
+
+The initial sandboxed Metal attempt could not create a command queue and was
+not counted. The first unsandboxed run with arbitrary IDs 101/202 was rejected,
+revealing that this configuration requires dense backend IDs in `0..n_seq_max`;
+the probe and decision record now enforce/document backend slots 0 and 1.
+
+### Verification results
+
+```text
+cargo fmt --all -- --check
+PASS.
+
+cargo clippy --workspace --all-targets -- -D warnings
+PASS — default mock-only workspace.
+
+cargo test --workspace
+PASS — 9 unit tests; 0 failed; doc tests passed (0 tests).
+
+cargo clippy -p niniserve-backend --features llamacpp \
+  --example two_sequences -- -D warnings
+PASS — native probe and adapter module.
+```
+
+### GitHub workflow
+
+Created focused issue
+[#6](https://github.com/nihalmaddala/NiniServe/issues/6) with the Phase 0 scope
+and acceptance evidence. Push, PR, CI, and merge outcomes are recorded only
+after they occur.
+
+### Next task
+
+Open the smallest Phase 1 issue: build a single-request real `ModelExecutor`
+adapter plus a single-owner worker and bounded Axum SSE vertical slice. Do not
+add multi-request scheduling or adaptive behavior in that issue.
+
+## 2026-10-08 — Phase 0 real-backend feasibility spike plan
+
+### Phase and gate
+
+Phase 0 backend feasibility on `spec/backend-feasibility-spike`. The gate is a
+real GGUF run proving that one llama.cpp context can prefill, interleave, sample,
+and explicitly clean up two independent sequences. Mock results do not satisfy
+this gate.
+
+### Plan
+
+1. Verify a current exact `llama-cpp-2` release and its vendored llama.cpp API
+   from primary, versioned source before adding the dependency.
+2. Record the binding surface for explicit sequence IDs and positions, batch
+   logits mapping, independent samplers, EOG detection, memory cleanup, and
+   `n_ctx`/`n_batch`/`n_ubatch` limits.
+3. Add the smallest feature-gated real adapter/probe wholly inside
+   `niniserve-backend`, preserving the deterministic mock backend and ordinary
+   CI behavior.
+4. Run `two_sequences` twice against the ignored Qwen2.5 GGUF, retaining trace
+   evidence and honestly marking the gate PASS or BLOCKED.
+5. Run formatting, Clippy, and workspace tests; then update the backend decision
+   and this log with exact versions, commands, results, limitations, and the
+   smallest Phase 1 follow-up.
+
+### Initial workflow note
+
+The first `gh auth status` check reported a stale credential and no browser
+surface was available, so the local branch was created before the issue. The
+later authenticated API call succeeded and created issue
+[#6](https://github.com/nihalmaddala/NiniServe/issues/6); no remote action is
+reported unless independently verified.
+
 ## 2026-10-08 — Local GGUF fixture setup
 
 Downloaded the official Apache-2.0 Qwen2.5-0.5B-Instruct Q4_K_M GGUF to the
