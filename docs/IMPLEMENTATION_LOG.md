@@ -121,10 +121,19 @@ The server integration suite also verifies `Cache-Control: no-cache`, stable
 per-stream creation time construction, and an explicit SSE `error` event
 without `[DONE]` when a backend error occurs after response headers.
 
-Git commits, PR, and CI results are recorded below once complete. After this
-gate, the next issue should be the smallest Phase 2 active registry and real
-multi-request batch-builder slice with explicit cancellation and batch traces.
-Do not add adaptive scheduling yet.
+### GitHub workflow
+
+```text
+2dd1e11 feat: add single-request streaming server
+28a7ea8 docs: record Phase 1 serving evidence
+
+PR #9: https://github.com/nihalmaddala/NiniServe/pull/9
+Rust checks: PASS in 47 seconds (run 37964049334, job 113933803815).
+```
+
+After this gate, the next issue should be the smallest Phase 2 active registry
+and real multi-request batch-builder slice with explicit cancellation and batch
+traces. Do not add adaptive scheduling yet.
 
 ## 2026-10-09 — Phase 0 real-backend feasibility result
 
