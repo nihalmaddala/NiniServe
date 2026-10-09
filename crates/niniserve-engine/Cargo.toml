@@ -1,0 +1,16 @@
+[package]
+name = "niniserve-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+niniserve-backend = { path = "../niniserve-backend" }
+niniserve-protocol = { path = "../niniserve-protocol" }
+tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[lints]
+workspace = true

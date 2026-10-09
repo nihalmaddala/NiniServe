@@ -1,0 +1,29 @@
+[package]
+name = "niniserve-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+llamacpp = ["niniserve-backend/llamacpp"]
+
+[dependencies]
+axum = { workspace = true, features = ["json", "tokio", "http1"] }
+niniserve-backend = { path = "../niniserve-backend" }
+niniserve-engine = { path = "../niniserve-engine" }
+niniserve-protocol = { path = "../niniserve-protocol" }
+serde = { workspace = true, features = ["derive"] }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal"] }
+tokio-stream = { workspace = true }
+
+[[bin]]
+name = "niniserve"
+path = "src/main.rs"
+required-features = ["llamacpp"]
+
+[dev-dependencies]
+tower = { workspace = true, features = ["util"] }
+
+[lints]
+workspace = true

@@ -34,16 +34,34 @@ pub struct ExecutionPlan {
 }
 
 /// Owned sampled output; no backend logit pointer escapes the executor call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendTokenEvent {
     pub sequence_id: SequenceId,
     pub evaluated_position: u32,
     pub sampled_token_id: u32,
+    /// Owned token bytes; callers must aggregate incomplete UTF-8 safely.
+    pub text_bytes: Vec<u8>,
+    pub is_eog: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SamplingConfig {
+    pub temperature: f32,
+    pub top_p: f32,
+    pub seed: u32,
 }
 
 /// Synchronous model execution owned by the future dedicated engine worker.
 pub trait ModelExecutor: Send {
     fn tokenize(&self, prompt: &str) -> Result<Vec<u32>, BackendError>;
+
+    fn start_sequence(
+        &mut self,
+        _sequence_id: SequenceId,
+        _sampling: SamplingConfig,
+    ) -> Result<(), BackendError> {
+        Ok(())
+    }
 
     fn execute(&mut self, plan: &ExecutionPlan) -> Result<Vec<BackendTokenEvent>, BackendError>;
 
@@ -72,6 +90,7 @@ pub enum BackendError {
         sequence_id: SequenceId,
     },
     UnknownSequence(SequenceId),
+    Native(String),
 }
 
 impl fmt::Display for BackendError {
@@ -100,6 +119,7 @@ impl fmt::Display for BackendError {
             Self::UnknownSequence(sequence_id) => {
                 write!(formatter, "sequence {} is not active", sequence_id.0)
             }
+            Self::Native(message) => formatter.write_str(message),
         }
     }
 }
