@@ -3,6 +3,129 @@
 This log records verified work, command outcomes, blockers, and the next scoped
 task. It is not a roadmap completion claim.
 
+## 2026-10-09 — Issue #8 Phase 1 vertical-slice plan
+
+### Phase and scope
+
+Phase 1 single-request serving foundation on
+`feat/phase1-streaming-vertical-slice`. This slice stops before multi-request
+continuous batching, scheduler policies, adaptive control, or benchmarks.
+
+### Plan
+
+1. Deepen `niniserve-backend` just enough for generated token text, EOG checks,
+   real sampler ownership, explicit pending-token positions, and guaranteed
+   sequence-slot cleanup.
+2. Add one dedicated synchronous engine worker with bounded command and output
+   channels; HTTP code never owns or calls the executor directly.
+3. Add a minimal Axum service with readiness-aware `GET /healthz` and validated,
+   streaming-only `POST /v1/completions` SSE behavior.
+4. Prove the vertical slice with deterministic mock integration tests, then run
+   one local real-GGUF streaming smoke test on Metal.
+5. Run formatting, warnings-denied Clippy, workspace tests, update this log with
+   exact evidence, and complete the issue/PR/CI workflow only when green.
+
+Tracking issue: [#8](https://github.com/nihalmaddala/NiniServe/issues/8).
+
+### Result
+
+PASS — the Phase 1 single-request vertical slice loads the real GGUF, streams
+generated text through HTTP/SSE, terminates at the requested token limit,
+releases sequence state, serves a second request, and shuts down cleanly.
+
+### Implemented
+
+- Extended the backend contract with per-sequence sampler initialization and
+  owned token bytes/EOG results while retaining the deterministic mock.
+- Added feature-gated `LlamaCppExecutor`, using `self_cell = 1.3.0` to contain
+  the model/context lifetime entirely in `niniserve-backend`.
+- Added `niniserve-engine`: one exclusive standard thread owns the synchronous
+  executor; bounded Tokio channels carry commands and per-request events.
+- Added explicit prompt/decode positions, pending-token progression,
+  max-token/EOG completion, UTF-8 token-piece aggregation, and whole-sequence
+  cleanup before terminal success.
+- Added `niniserve-server`: readiness-aware `/healthz`, validated streaming-only
+  `/v1/completions`, bounded SSE forwarding, CLI model/port parsing, and
+  Ctrl-C shutdown.
+- The last engine handle now closes and joins the worker. This guarantees the
+  llama.cpp context and Metal resources finish teardown before process exit.
+
+The fixed Phase 1 backend slot is `SequenceId(0)` and only one generation is
+processed at a time. This milestone does not implement or claim continuous
+batching, request interleaving, adaptive scheduling, explicit cancel commands,
+timeouts, or OpenAI API completeness.
+
+### Mock and integration evidence
+
+```text
+cargo test -p niniserve-engine -p niniserve-server
+PASS — sequential requests streamed and reused the only mock backend slot;
+HTTP health/streaming and validation tests passed.
+
+Engine teardown regression
+PASS — dropping the final cloned EngineHandle joins the worker and synchronously
+drops its executor.
+```
+
+### Real-model evidence
+
+```text
+cargo check -p niniserve-server --features llamacpp
+PASS.
+
+cargo build -p niniserve-server --features llamacpp --bin niniserve
+PASS.
+
+target/debug/niniserve \
+  --model models/qwen2.5-0.5b-instruct-q4_k_m.gguf --port 18080
+PASS outside the restricted sandbox — Apple M2 Metal, 25/25 layers offloaded,
+n_ctx=2048, n_batch=512, n_ubatch=128, n_seq_max=1.
+
+GET /healthz
+PASS — 200 {"status":"ok","model_loaded":true}.
+
+POST /v1/completions, prompt "The capital of France is", greedy, 12 tokens
+PASS — 12 coherent non-empty SSE fragments, finish_reason "length", [DONE].
+Observed text: " Paris. It is the largest city in Europe and the second".
+
+Second sequential POST, prompt "2 + 2 =", greedy, 8 tokens
+PASS — 200, 8 non-empty fragments, finish_reason "length", [DONE]. The second
+request proves the single backend sequence slot was released and reused.
+Warm observation: first SSE at 0.037 s; total 0.100 s; 126.708 non-empty
+fragments/s after first SSE. This is a single smoke observation, not a benchmark
+or a token-throughput performance claim.
+```
+
+The first Ctrl-C smoke ended with exit 134 because the then-detached engine
+worker raced process teardown and llama.cpp asserted that a Metal residency set
+was still populated. After adding final-handle channel closure plus worker join,
+the repeated Ctrl-C test exited 0 and logged `ggml_metal_free: deallocating`.
+
+### Remaining verification and next task
+
+```text
+cargo fmt --all -- --check
+PASS.
+
+cargo clippy --workspace --all-targets -- -D warnings
+PASS — default mock-only workspace.
+
+cargo test --workspace
+PASS — 14 unit tests; 0 failed; doc tests passed (0 tests).
+
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+PASS — includes the native llama.cpp adapter, real server binary, and probe.
+```
+
+The server integration suite also verifies `Cache-Control: no-cache`, stable
+per-stream creation time construction, and an explicit SSE `error` event
+without `[DONE]` when a backend error occurs after response headers.
+
+Git commits, PR, and CI results are recorded below once complete. After this
+gate, the next issue should be the smallest Phase 2 active registry and real
+multi-request batch-builder slice with explicit cancellation and batch traces.
+Do not add adaptive scheduling yet.
+
 ## 2026-10-09 — Phase 0 real-backend feasibility result
 
 ### Outcome

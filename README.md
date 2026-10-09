@@ -11,25 +11,30 @@ time-to-first-token, inter-token latency, throughput, and fairness.
 
 ## Project status
 
-NiniServe is in **Phase 0: repository and backend feasibility**. The repository
-contains a compiling Rust workspace with model-independent protocol types and a
-deterministic mock backend for validating sequence positions, routing, limits,
-and cleanup. There is not yet a runnable server or a verified llama.cpp
-integration. No real inference or performance claims have been established.
+NiniServe has passed **Phase 0 backend feasibility** and now has the **Phase 1
+single-request serving foundation**. The repository contains a real
+`llama-cpp-2` adapter, one dedicated engine thread, bounded command/event
+channels, and an Axum server that streams one request at a time over SSE. The
+deterministic mock remains the default backend for ordinary tests.
+
+The supplied Qwen2.5 0.5B GGUF has generated real output on Apple M2 Metal.
+This is not yet a multi-request server: continuous batching, explicit
+cancellation commands, timeouts, scheduler policies, and adaptive control are
+later phases.
 
 The canonical requirements and phase gates are in
 [`NINISERVE_MASTER_SPEC.md`](NINISERVE_MASTER_SPEC.md). Coding agents must also
 follow [`AGENTS.md`](AGENTS.md).
 
-## Planned first milestones
+## Verified milestones and next boundary
 
-1. Audit and pin the Rust and native build toolchains.
-2. Verify low-level llama.cpp APIs for explicit sequence IDs, token positions,
-   logits association, independent sampling, and sequence cleanup.
-3. Build a deterministic mock-backed engine skeleton.
-4. Prove two independent sequences in one real model context when a local GGUF
-   model is available.
-5. Build the minimal single-request HTTP/SSE vertical slice.
+1. The native toolchain and `llama-cpp-2 = 0.1.159` are exactly pinned.
+2. The standalone real-model probe proved two explicit sequences in one
+   context with correct logits routing and cleanup.
+3. The Phase 1 service loads one GGUF, generates on its exclusive engine
+   thread, streams SSE, and releases the sequence for the next request.
+4. The next phase is actual multi-request continuous batching. It is not
+   implemented or claimed here.
 
 Later scheduling and benchmark work begins only after the relevant phase gates
 pass.
@@ -90,10 +95,37 @@ The workspace currently contains:
 - `niniserve-protocol`: typed request/sequence IDs, request validation, and
   lifecycle transitions;
 - `niniserve-backend`: the synchronous executor contract and deterministic mock
-  implementation.
+  implementation plus a feature-gated real llama.cpp adapter;
+- `niniserve-engine`: the exclusive synchronous model owner with bounded
+  commands and per-request events;
+- `niniserve-server`: the Axum routes and feature-gated `niniserve` binary.
 
 See [`docs/BACKEND_DECISION.md`](docs/BACKEND_DECISION.md) for the boundary
-between verified mock behavior and the still-blocked real backend spike.
+between mock, real-backend, and serving evidence.
+
+## Run the local server
+
+Build and start with a user-supplied GGUF:
+
+```bash
+cargo run -p niniserve-server --features llamacpp --bin niniserve -- \
+  --model models/qwen2.5-0.5b-instruct-q4_k_m.gguf \
+  --port 8080
+```
+
+In another terminal:
+
+```bash
+curl http://127.0.0.1:8080/healthz
+
+curl -N http://127.0.0.1:8080/v1/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"local-gguf","prompt":"The capital of France is","max_tokens":12,"temperature":0,"stream":true}'
+```
+
+The completion endpoint is intentionally OpenAI-inspired, not fully
+OpenAI-compatible. Phase 1 requires `stream: true`, uses a fixed model ID of
+`local-gguf`, and supports one active generation at a time.
 
 ## Scope boundary
 
