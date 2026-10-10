@@ -8,7 +8,7 @@ use std::{
 };
 
 use niniserve_backend::llamacpp::{LlamaCppConfig, LlamaCppExecutor};
-use niniserve_engine::{EngineConfig, EngineHandle};
+use niniserve_engine::{EngineConfig, EngineHandle, SchedulerConfig};
 use niniserve_protocol::RequestLimits;
 use niniserve_server::router;
 
@@ -61,6 +61,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             pending_capacity: 16,
             event_capacity: 32,
             request_timeout: std::time::Duration::from_secs(120),
+            scheduler: SchedulerConfig::DecodePriority,
         },
     );
     let app = router(

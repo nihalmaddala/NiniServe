@@ -297,7 +297,7 @@ mod tests {
     use niniserve_backend::{
         BackendError, BackendLimits, BackendTokenEvent, ExecutionPlan, MockExecutor, ModelExecutor,
     };
-    use niniserve_engine::{EngineConfig, EngineHandle};
+    use niniserve_engine::{EngineConfig, EngineHandle, SchedulerConfig};
     use niniserve_protocol::{RequestLimits, SequenceId};
     use tower::ServiceExt;
 
@@ -315,6 +315,7 @@ mod tests {
                 pending_capacity: 2,
                 event_capacity: 8,
                 request_timeout: std::time::Duration::from_secs(30),
+                scheduler: SchedulerConfig::DecodePriority,
             },
         );
         router(
@@ -392,6 +393,7 @@ mod tests {
                 pending_capacity: 1,
                 event_capacity: 4,
                 request_timeout: std::time::Duration::from_secs(30),
+                scheduler: SchedulerConfig::DecodePriority,
             },
         );
         let response = router(

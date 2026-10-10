@@ -3,6 +3,7 @@ members = [
     "crates/niniserve-backend",
     "crates/niniserve-engine",
     "crates/niniserve-protocol",
+    "crates/niniserve-scheduler",
     "crates/niniserve-server",
 ]
 resolver = "3"

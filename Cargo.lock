@@ -452,12 +452,20 @@ version = "0.1.0"
 dependencies = [
  "niniserve-backend",
  "niniserve-protocol",
+ "niniserve-scheduler",
  "tokio",
 ]
 
 [[package]]
 name = "niniserve-protocol"
 version = "0.1.0"
+
+[[package]]
+name = "niniserve-scheduler"
+version = "0.1.0"
+dependencies = [
+ "niniserve-protocol",
+]
 
 [[package]]
 name = "niniserve-server"

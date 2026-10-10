@@ -15,7 +15,12 @@ use niniserve_backend::{
     BackendTokenEvent, BatchToken, ExecutionPlan, ModelExecutor, SamplingConfig,
 };
 use niniserve_protocol::{FinishReason, GenerationEvent, GenerationRequest, RequestId, SequenceId};
+use niniserve_scheduler::{
+    BaselineScheduler, EngineView, Scheduler, SequencePhase, SequenceSnapshot, StepBudget, WorkKind,
+};
 use tokio::sync::mpsc;
+
+pub use niniserve_scheduler::SchedulerConfig;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EngineConfig {
@@ -23,6 +28,7 @@ pub struct EngineConfig {
     pub pending_capacity: usize,
     pub event_capacity: usize,
     pub request_timeout: Duration,
+    pub scheduler: SchedulerConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +85,7 @@ impl EngineHandle {
                     receiver,
                     config.pending_capacity,
                     config.request_timeout,
+                    config.scheduler,
                 );
                 worker_ready.store(true, Ordering::Release);
                 let _ = started.send(());
@@ -213,6 +220,8 @@ struct EngineRuntime<E> {
     active: BTreeMap<SequenceId, ActiveRequest>,
     free_slots: Vec<SequenceId>,
     max_batch_tokens: usize,
+    scheduler: BaselineScheduler,
+    next_admission_order: u64,
     step: u64,
 }
 
@@ -222,6 +231,7 @@ impl<E: ModelExecutor> EngineRuntime<E> {
         commands: mpsc::Receiver<EngineCommand>,
         pending_capacity: usize,
         request_timeout: Duration,
+        scheduler_config: SchedulerConfig,
     ) -> Self {
         let limits = executor.limits();
         let capacity = limits.max_active_sequences.min(limits.max_batch_tokens);
@@ -239,6 +249,8 @@ impl<E: ModelExecutor> EngineRuntime<E> {
             active: BTreeMap::new(),
             free_slots,
             max_batch_tokens: limits.max_batch_tokens,
+            scheduler: BaselineScheduler::new(scheduler_config),
+            next_admission_order: 0,
             step: 0,
         }
     }
@@ -284,10 +296,13 @@ impl<E: ModelExecutor> EngineRuntime<E> {
                         message: "engine pending queue is full".to_owned(),
                     });
                 } else {
+                    let admission_order = self.next_admission_order;
+                    self.next_admission_order = self.next_admission_order.saturating_add(1);
                     self.pending.push_back(PendingRequest {
                         request,
                         events,
                         enqueued_at: Instant::now(),
+                        admission_order,
                     });
                 }
             }
@@ -342,31 +357,78 @@ impl<E: ModelExecutor> EngineRuntime<E> {
 
     fn execute_step(&mut self) {
         let scheduling_started = Instant::now();
-        let planned = self
+        let snapshot = self
             .active
             .iter()
-            .take(self.max_batch_tokens)
-            .map(|(&sequence_id, request)| PlannedToken {
+            .map(|(&sequence_id, request)| SequenceSnapshot {
                 sequence_id,
-                token: request.next_token(sequence_id),
-                phase: request.phase_name(),
+                admission_order: request.admission_order,
+                phase: request.scheduler_phase(),
+                remaining_prefill_tokens: request.remaining_prefill_tokens(),
+            })
+            .collect::<Vec<_>>();
+        let scheduled = self.scheduler.plan(
+            EngineView {
+                sequences: &snapshot,
+            },
+            StepBudget {
+                max_batch_tokens: self.max_batch_tokens,
+            },
+        );
+        let planned = scheduled
+            .work
+            .into_iter()
+            .filter_map(|work| {
+                self.active
+                    .get(&work.sequence_id)
+                    .map(|request| PlannedWork {
+                        sequence_id: work.sequence_id,
+                        tokens: request.batch_tokens(work.sequence_id, work.token_count),
+                        kind: work.kind,
+                    })
             })
             .collect::<Vec<_>>();
         let plan = ExecutionPlan {
-            tokens: planned.iter().map(|work| work.token).collect(),
+            tokens: planned
+                .iter()
+                .flat_map(|work| work.tokens.iter().copied())
+                .collect(),
         };
+        if plan.tokens.is_empty() {
+            self.fail_all("scheduler returned an empty plan for active requests".to_owned());
+            return;
+        }
         let scheduling_us = scheduling_started.elapsed().as_micros();
         let backend_started = Instant::now();
         let result = self.executor.execute(&plan);
         let backend_us = backend_started.elapsed().as_micros();
         eprintln!(
-            "engine_batch step={} members=[{}] scheduling_us={} backend_us={}",
+            "scheduler_step step={} policy={} prefill_tokens={} decode_tokens={} members=[{}] scheduling_us={} backend_us={}",
             self.step,
+            self.scheduler.name(),
             planned
                 .iter()
-                .map(|work| format!(
+                .filter(|work| work.kind == WorkKind::Prefill)
+                .map(|work| work.tokens.len())
+                .sum::<usize>(),
+            planned
+                .iter()
+                .filter(|work| work.kind == WorkKind::Decode)
+                .map(|work| work.tokens.len())
+                .sum::<usize>(),
+            planned
+                .iter()
+                .flat_map(|work| work.tokens.iter())
+                .map(|token| format!(
                     "seq:{} pos:{} phase:{} logits:{}",
-                    work.sequence_id.0, work.token.position, work.phase, work.token.request_logits
+                    token.sequence_id.0,
+                    token.position,
+                    if token.request_logits {
+                        "decode-or-prefill-end"
+                    } else {
+                        "prefill"
+                    },
+                    token.request_logits
                 ))
                 .collect::<Vec<_>>()
                 .join(", "),
@@ -391,7 +453,7 @@ impl<E: ModelExecutor> EngineRuntime<E> {
             let Some(request) = self.active.get_mut(&work.sequence_id) else {
                 continue;
             };
-            match request.advance(work.token, output) {
+            match request.advance(&work.tokens, output) {
                 Ok(Some(reason)) => finished.push((work.sequence_id, EndState::Completed(reason))),
                 Ok(None) => {}
                 Err(error) => finished.push((work.sequence_id, error)),
@@ -526,6 +588,7 @@ struct PendingRequest {
     request: GenerationRequest,
     events: mpsc::Sender<GenerationEvent>,
     enqueued_at: Instant,
+    admission_order: u64,
 }
 
 struct ActiveRequest {
@@ -534,6 +597,7 @@ struct ActiveRequest {
     phase: RequestPhase,
     text: Utf8Accumulator,
     enqueued_at: Instant,
+    admission_order: u64,
 }
 
 impl ActiveRequest {
@@ -599,45 +663,62 @@ impl ActiveRequest {
             phase: RequestPhase::Prefill { prompt, next: 0 },
             text: Utf8Accumulator::default(),
             enqueued_at: pending.enqueued_at,
+            admission_order: pending.admission_order,
         })
     }
 
-    fn next_token(&self, sequence_id: SequenceId) -> BatchToken {
+    fn batch_tokens(&self, sequence_id: SequenceId, token_count: usize) -> Vec<BatchToken> {
         match &self.phase {
-            RequestPhase::Prefill { prompt, next } => BatchToken {
-                sequence_id,
-                token_id: prompt[*next],
-                position: u32::try_from(*next).expect("prompt position exceeds u32"),
-                request_logits: *next + 1 == prompt.len(),
-            },
+            RequestPhase::Prefill { prompt, next } => {
+                let end = next.saturating_add(token_count).min(prompt.len());
+                (*next..end)
+                    .map(|position| BatchToken {
+                        sequence_id,
+                        token_id: prompt[position],
+                        position: u32::try_from(position).expect("prompt position exceeds u32"),
+                        request_logits: position + 1 == prompt.len(),
+                    })
+                    .collect()
+            }
             RequestPhase::Decode {
                 pending_token,
                 next_position,
                 ..
-            } => BatchToken {
+            } => vec![BatchToken {
                 sequence_id,
                 token_id: *pending_token,
                 position: *next_position,
                 request_logits: true,
-            },
+            }],
         }
     }
 
-    fn phase_name(&self) -> &'static str {
+    fn scheduler_phase(&self) -> SequencePhase {
         match self.phase {
-            RequestPhase::Prefill { .. } => "prefill",
-            RequestPhase::Decode { .. } => "decode",
+            RequestPhase::Prefill { .. } => SequencePhase::Prefill,
+            RequestPhase::Decode { .. } => SequencePhase::Decode,
+        }
+    }
+
+    fn remaining_prefill_tokens(&self) -> usize {
+        match &self.phase {
+            RequestPhase::Prefill { prompt, next } => prompt.len() - next,
+            RequestPhase::Decode { .. } => 0,
         }
     }
 
     fn advance(
         &mut self,
-        submitted: BatchToken,
+        submitted: &[BatchToken],
         output: Option<BackendTokenEvent>,
     ) -> Result<Option<FinishReason>, EndState> {
+        let final_token = submitted
+            .last()
+            .copied()
+            .ok_or_else(|| EndState::Error("scheduler submitted empty sequence work".to_owned()))?;
         match &mut self.phase {
             RequestPhase::Prefill { prompt, next } => {
-                *next += 1;
+                *next += submitted.len();
                 if *next < prompt.len() {
                     if output.is_some() {
                         return Err(EndState::Error(
@@ -646,15 +727,15 @@ impl ActiveRequest {
                     }
                     return Ok(None);
                 }
-                let output = validate_output(submitted, output)?;
-                self.accept_sample(output, 1, submitted.position.saturating_add(1))
+                let output = validate_output(final_token, output)?;
+                self.accept_sample(output, 1, final_token.position.saturating_add(1))
             }
             RequestPhase::Decode {
                 generated,
                 next_position,
                 ..
             } => {
-                let output = validate_output(submitted, output)?;
+                let output = validate_output(final_token, output)?;
                 let generated = generated.saturating_add(1);
                 let next_position = next_position.saturating_add(1);
                 self.accept_sample(output, generated, next_position)
@@ -729,10 +810,10 @@ enum RequestPhase {
         generated: u32,
     },
 }
-struct PlannedToken {
+struct PlannedWork {
     sequence_id: SequenceId,
-    token: BatchToken,
-    phase: &'static str,
+    tokens: Vec<BatchToken>,
+    kind: WorkKind,
 }
 enum EndState {
     Completed(FinishReason),
@@ -799,7 +880,7 @@ impl Utf8Accumulator {
 
 #[cfg(test)]
 mod tests {
-    use super::{EngineConfig, EngineHandle};
+    use super::{EngineConfig, EngineHandle, SchedulerConfig};
     use niniserve_backend::{
         BackendError, BackendLimits, BackendTokenEvent, BatchToken, ExecutionPlan, MockExecutor,
         ModelExecutor, SamplingConfig,
@@ -827,6 +908,7 @@ mod tests {
             pending_capacity: 4,
             event_capacity: 128,
             request_timeout: Duration::from_secs(30),
+            scheduler: SchedulerConfig::DecodePriority,
         }
     }
     async fn collect(engine: &EngineHandle, id: u64) -> Vec<GenerationEvent> {
@@ -979,6 +1061,7 @@ mod tests {
                 pending_capacity: 1,
                 event_capacity: 128,
                 request_timeout: Duration::from_secs(30),
+                scheduler: SchedulerConfig::DecodePriority,
             },
         );
         let first = engine.try_generate(request(50)).expect("first is accepted");
