@@ -116,9 +116,18 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 PASS — includes the native llama.cpp adapter and server binary.
 ```
 
-Git commits, PR, and CI results are recorded after they occur. Stop after Phase
-2; the next issue is the smallest Phase 3 baseline scheduler and measurement
-slice, not adaptive control.
+### GitHub workflow
+
+```text
+b47c50f feat(engine): add multi-request continuous batching
+004cb2d docs: record Phase 2 batching evidence
+
+PR #11: https://github.com/nihalmaddala/NiniServe/pull/11
+Rust checks: PASS in 42 seconds (run 38078900440, job 114291559029).
+```
+
+Stop after Phase 2; the next issue is the smallest Phase 3 baseline scheduler
+and measurement slice, not adaptive control.
 
 ## 2026-10-09 — Issue #8 Phase 1 vertical-slice plan
 
