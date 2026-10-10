@@ -252,23 +252,18 @@ async fn run(config: RunConfig) -> Result<(), Box<dyn Error>> {
             scheduler: config.scheduler,
         },
     );
-    let run_started = Instant::now();
-    let mut tasks = Vec::with_capacity(requests.len());
-    for request in requests {
-        let engine = engine.clone();
-        tasks.push(tokio::spawn(measure_request(
-            engine,
-            request,
-            config.scheduler,
-            run_started,
-        )));
-    }
-    let mut results = Vec::with_capacity(tasks.len());
-    for task in tasks {
-        results.push(task.await??);
-    }
-    results.sort_unstable_by_key(|result| result.request_id);
-    let steps = engine.recent_step_observations();
+    let warmup = requests
+        .iter()
+        .cloned()
+        .map(|mut request| {
+            request.id = RequestId(request.id.0 + 10_000);
+            request
+        })
+        .collect();
+    execute_requests(&engine, warmup, config.scheduler).await?;
+    let _ = engine.take_step_observations();
+    let results = execute_requests(&engine, requests, config.scheduler).await?;
+    let steps = engine.take_step_observations();
     let metadata = Metadata {
         run_id: &run_id,
         git_commit: command_output("git", &["rev-parse", "HEAD"]),
@@ -284,7 +279,7 @@ async fn run(config: RunConfig) -> Result<(), Box<dyn Error>> {
             prefill_chunk_tokens: chunk_budget(config.scheduler),
         },
         workload: config.workload.name(),
-        warmup_requests: 0,
+        warmup_requests: measured_requests,
         measured_requests,
         model_load_ms,
         started_at_unix_seconds,
@@ -298,6 +293,29 @@ async fn run(config: RunConfig) -> Result<(), Box<dyn Error>> {
     println!("results written to {}", output.display());
     println!("{}", serde_json::to_string_pretty(&summary)?);
     Ok(())
+}
+
+async fn execute_requests(
+    engine: &EngineHandle,
+    requests: Vec<RequestSpec>,
+    scheduler: SchedulerConfig,
+) -> Result<Vec<RequestResult>, Box<dyn Error>> {
+    let run_started = Instant::now();
+    let mut tasks = Vec::with_capacity(requests.len());
+    for request in requests {
+        tasks.push(tokio::spawn(measure_request(
+            engine.clone(),
+            request,
+            scheduler,
+            run_started,
+        )));
+    }
+    let mut results = Vec::with_capacity(tasks.len());
+    for task in tasks {
+        results.push(task.await??);
+    }
+    results.sort_unstable_by_key(|result| result.request_id);
+    Ok(results)
 }
 
 async fn measure_request(

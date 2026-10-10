@@ -162,6 +162,14 @@ impl EngineHandle {
         )
     }
 
+    #[must_use]
+    pub fn take_step_observations(&self) -> Vec<EngineStepObservation> {
+        self.inner.observations.lock().map_or_else(
+            |_| Vec::new(),
+            |mut observations| observations.drain(..).collect(),
+        )
+    }
+
     fn try_send(&self, command: EngineCommand) -> Result<(), EngineSubmitError> {
         self.inner
             .commands
@@ -485,18 +493,22 @@ impl<E: ModelExecutor> EngineRuntime<E> {
             decode_tokens,
             planned
                 .iter()
-                .flat_map(|work| work.tokens.iter())
-                .map(|token| format!(
-                    "seq:{} pos:{} phase:{} logits:{}",
-                    token.sequence_id.0,
-                    token.position,
-                    if token.request_logits {
-                        "decode-or-prefill-end"
-                    } else {
-                        "prefill"
-                    },
-                    token.request_logits
-                ))
+                .map(|work| {
+                    let first = work.tokens.first().expect("planned work is nonempty");
+                    let last = work.tokens.last().expect("planned work is nonempty");
+                    format!(
+                        "seq:{} positions:{}..{} phase:{} tokens:{} logits:{}",
+                        work.sequence_id.0,
+                        first.position,
+                        last.position,
+                        match work.kind {
+                            WorkKind::Prefill => "prefill",
+                            WorkKind::Decode => "decode",
+                        },
+                        work.tokens.len(),
+                        work.tokens.iter().any(|token| token.request_logits)
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join(", "),
             scheduling_us,

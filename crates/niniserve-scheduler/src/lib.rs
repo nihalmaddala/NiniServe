@@ -202,16 +202,17 @@ fn plan_decode_priority(
         });
         remaining -= 1;
     }
+    let mut remaining_prefill = prefill_chunk.unwrap_or(remaining).min(remaining);
     for sequence in sequences
         .iter()
         .filter(|sequence| sequence.phase == SequencePhase::Prefill)
     {
-        if remaining == 0 {
+        if remaining == 0 || remaining_prefill == 0 {
             break;
         }
         let token_count = sequence
             .remaining_prefill_tokens
-            .min(prefill_chunk.unwrap_or(remaining))
+            .min(remaining_prefill)
             .min(remaining);
         if token_count > 0 {
             work.push(ScheduledWork {
@@ -220,6 +221,7 @@ fn plan_decode_priority(
                 kind: WorkKind::Prefill,
             });
             remaining -= token_count;
+            remaining_prefill -= token_count;
         }
     }
     work
@@ -308,7 +310,7 @@ mod tests {
     }
 
     #[test]
-    fn fixed_chunk_caps_each_prefill_allocation() {
+    fn fixed_chunk_caps_total_prefill_work_per_step() {
         let sequences = [
             sequence(0, 1, SequencePhase::Prefill, 8),
             sequence(1, 2, SequencePhase::Prefill, 8),
@@ -327,18 +329,11 @@ mod tests {
 
         assert_eq!(
             plan.work,
-            vec![
-                ScheduledWork {
-                    sequence_id: SequenceId(0),
-                    token_count: 3,
-                    kind: WorkKind::Prefill,
-                },
-                ScheduledWork {
-                    sequence_id: SequenceId(1),
-                    token_count: 2,
-                    kind: WorkKind::Prefill,
-                },
-            ]
+            vec![ScheduledWork {
+                sequence_id: SequenceId(0),
+                token_count: 3,
+                kind: WorkKind::Prefill,
+            }]
         );
     }
 
