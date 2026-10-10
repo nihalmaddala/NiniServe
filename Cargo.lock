@@ -447,6 +447,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "niniserve-bench"
+version = "0.1.0"
+dependencies = [
+ "niniserve-backend",
+ "niniserve-engine",
+ "niniserve-protocol",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "niniserve-engine"
 version = "0.1.0"
 dependencies = [
@@ -475,6 +487,7 @@ dependencies = [
  "niniserve-backend",
  "niniserve-engine",
  "niniserve-protocol",
+ "niniserve-scheduler",
  "serde",
  "tokio",
  "tokio-stream",

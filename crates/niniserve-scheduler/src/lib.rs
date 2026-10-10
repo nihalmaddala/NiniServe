@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+use std::{error::Error, fmt, str::FromStr};
+
 use niniserve_protocol::SequenceId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,9 +53,55 @@ pub enum SchedulerConfig {
     FixedChunk { prefill_chunk_tokens: usize },
 }
 
+pub const DEFAULT_PREFILL_CHUNK_TOKENS: usize = 128;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseSchedulerError {
+    value: String,
+}
+
+impl fmt::Display for ParseSchedulerError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "unknown scheduler {:?}; expected fcfs, decode-priority, or fixed-chunk",
+            self.value
+        )
+    }
+}
+
+impl Error for ParseSchedulerError {}
+
+impl FromStr for SchedulerConfig {
+    type Err = ParseSchedulerError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "fcfs" => Ok(Self::Fcfs),
+            "decode-priority" => Ok(Self::DecodePriority),
+            "fixed-chunk" => Ok(Self::FixedChunk {
+                prefill_chunk_tokens: DEFAULT_PREFILL_CHUNK_TOKENS,
+            }),
+            _ => Err(ParseSchedulerError {
+                value: value.to_owned(),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StepObservation {
+    pub scheduled_tokens: usize,
+    pub prefill_tokens: usize,
+    pub decode_tokens: usize,
+    pub scheduling_micros: u128,
+    pub backend_micros: u128,
+}
+
 pub trait Scheduler {
     fn name(&self) -> &'static str;
     fn plan(&self, view: EngineView<'_>, budget: StepBudget) -> SchedulePlan;
+    fn observe(&mut self, _observation: StepObservation) {}
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -74,6 +122,11 @@ impl BaselineScheduler {
             );
         }
         Self { config }
+    }
+
+    #[must_use]
+    pub const fn config(&self) -> SchedulerConfig {
+        self.config
     }
 }
 
@@ -287,5 +340,61 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn policy_names_parse_to_their_documented_configs() {
+        assert_eq!("fcfs".parse(), Ok(SchedulerConfig::Fcfs));
+        assert_eq!(
+            "decode-priority".parse(),
+            Ok(SchedulerConfig::DecodePriority)
+        );
+        assert!("adaptive".parse::<SchedulerConfig>().is_err());
+    }
+
+    #[test]
+    fn admission_order_is_the_deterministic_tie_breaker() {
+        let sequences = [
+            sequence(7, 2, SequencePhase::Decode, 0),
+            sequence(9, 1, SequencePhase::Decode, 0),
+            sequence(3, 1, SequencePhase::Decode, 0),
+        ];
+
+        let plan = BaselineScheduler::new(SchedulerConfig::DecodePriority).plan(
+            EngineView {
+                sequences: &sequences,
+            },
+            StepBudget {
+                max_batch_tokens: 3,
+            },
+        );
+
+        assert_eq!(
+            plan.work
+                .iter()
+                .map(|work| work.sequence_id)
+                .collect::<Vec<_>>(),
+            vec![SequenceId(3), SequenceId(9), SequenceId(7)]
+        );
+    }
+
+    #[test]
+    fn decode_priority_documents_prefill_starvation_at_a_saturated_budget() {
+        let sequences = [
+            sequence(0, 1, SequencePhase::Prefill, 20),
+            sequence(1, 2, SequencePhase::Decode, 0),
+            sequence(2, 3, SequencePhase::Decode, 0),
+        ];
+
+        let plan = BaselineScheduler::new(SchedulerConfig::DecodePriority).plan(
+            EngineView {
+                sequences: &sequences,
+            },
+            StepBudget {
+                max_batch_tokens: 2,
+            },
+        );
+
+        assert!(plan.work.iter().all(|work| work.kind == WorkKind::Decode));
     }
 }

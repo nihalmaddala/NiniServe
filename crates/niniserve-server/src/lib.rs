@@ -143,11 +143,16 @@ async fn forward_sse(
             GenerationEvent::Started { .. } => continue,
             GenerationEvent::Token {
                 request_id, text, ..
-            } => (
-                completion_event(request_id, &model, created, text, None),
-                false,
-                false,
-            ),
+            } => {
+                if text.is_empty() {
+                    continue;
+                }
+                (
+                    completion_event(request_id, &model, created, text, None),
+                    false,
+                    false,
+                )
+            }
             GenerationEvent::Completed {
                 request_id,
                 finish_reason,

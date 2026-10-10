@@ -22,6 +22,22 @@ use tokio::sync::mpsc;
 
 pub use niniserve_scheduler::SchedulerConfig;
 
+const RECENT_STEP_CAPACITY: usize = 4_096;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngineStepObservation {
+    pub engine_step: u64,
+    pub timestamp_ms: u128,
+    pub policy: &'static str,
+    pub active_sequences: usize,
+    pub queued_requests: usize,
+    pub prefill_tokens: usize,
+    pub decode_tokens: usize,
+    pub chunk_budget: Option<usize>,
+    pub backend_step_micros: u128,
+    pub scheduler_step_micros: u128,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EngineConfig {
     pub command_capacity: usize,
@@ -42,6 +58,7 @@ struct EngineInner {
     ready: Arc<AtomicBool>,
     event_capacity: usize,
     worker: Mutex<Option<thread::JoinHandle<()>>>,
+    observations: Arc<Mutex<VecDeque<EngineStepObservation>>>,
 }
 
 impl Drop for EngineInner {
@@ -77,6 +94,8 @@ impl EngineHandle {
         let ready = Arc::new(AtomicBool::new(false));
         let worker_ready = Arc::clone(&ready);
         let (started, wait_for_start) = std::sync::mpsc::sync_channel(0);
+        let observations = Arc::new(Mutex::new(VecDeque::with_capacity(RECENT_STEP_CAPACITY)));
+        let worker_observations = Arc::clone(&observations);
         let worker = thread::Builder::new()
             .name("niniserve-engine".to_owned())
             .spawn(move || {
@@ -86,6 +105,7 @@ impl EngineHandle {
                     config.pending_capacity,
                     config.request_timeout,
                     config.scheduler,
+                    worker_observations,
                 );
                 worker_ready.store(true, Ordering::Release);
                 let _ = started.send(());
@@ -102,6 +122,7 @@ impl EngineHandle {
                 ready,
                 event_capacity: config.event_capacity,
                 worker: Mutex::new(Some(worker)),
+                observations,
             }),
         }
     }
@@ -131,6 +152,14 @@ impl EngineHandle {
 
     pub fn try_cancel(&self, request_id: RequestId) -> Result<(), EngineSubmitError> {
         self.try_send(EngineCommand::Cancel { request_id })
+    }
+
+    #[must_use]
+    pub fn recent_step_observations(&self) -> Vec<EngineStepObservation> {
+        self.inner.observations.lock().map_or_else(
+            |_| Vec::new(),
+            |observations| observations.iter().cloned().collect(),
+        )
     }
 
     fn try_send(&self, command: EngineCommand) -> Result<(), EngineSubmitError> {
@@ -222,6 +251,8 @@ struct EngineRuntime<E> {
     max_batch_tokens: usize,
     scheduler: BaselineScheduler,
     next_admission_order: u64,
+    started_at: Instant,
+    observations: Arc<Mutex<VecDeque<EngineStepObservation>>>,
     step: u64,
 }
 
@@ -232,6 +263,7 @@ impl<E: ModelExecutor> EngineRuntime<E> {
         pending_capacity: usize,
         request_timeout: Duration,
         scheduler_config: SchedulerConfig,
+        observations: Arc<Mutex<VecDeque<EngineStepObservation>>>,
     ) -> Self {
         let limits = executor.limits();
         let capacity = limits.max_active_sequences.min(limits.max_batch_tokens);
@@ -251,6 +283,8 @@ impl<E: ModelExecutor> EngineRuntime<E> {
             max_batch_tokens: limits.max_batch_tokens,
             scheduler: BaselineScheduler::new(scheduler_config),
             next_admission_order: 0,
+            started_at: Instant::now(),
+            observations,
             step: 0,
         }
     }
@@ -402,20 +436,53 @@ impl<E: ModelExecutor> EngineRuntime<E> {
         let backend_started = Instant::now();
         let result = self.executor.execute(&plan);
         let backend_us = backend_started.elapsed().as_micros();
+        let prefill_tokens = planned
+            .iter()
+            .filter(|work| work.kind == WorkKind::Prefill)
+            .map(|work| work.tokens.len())
+            .sum::<usize>();
+        let decode_tokens = planned
+            .iter()
+            .filter(|work| work.kind == WorkKind::Decode)
+            .map(|work| work.tokens.len())
+            .sum::<usize>();
+        self.scheduler
+            .observe(niniserve_scheduler::StepObservation {
+                scheduled_tokens: plan.tokens.len(),
+                prefill_tokens,
+                decode_tokens,
+                scheduling_micros: scheduling_us,
+                backend_micros: backend_us,
+            });
+        let chunk_budget = match self.scheduler.config() {
+            SchedulerConfig::FixedChunk {
+                prefill_chunk_tokens,
+            } => Some(prefill_chunk_tokens),
+            SchedulerConfig::Fcfs | SchedulerConfig::DecodePriority => None,
+        };
+        if let Ok(mut observations) = self.observations.lock() {
+            if observations.len() == RECENT_STEP_CAPACITY {
+                observations.pop_front();
+            }
+            observations.push_back(EngineStepObservation {
+                engine_step: self.step,
+                timestamp_ms: self.started_at.elapsed().as_millis(),
+                policy: self.scheduler.name(),
+                active_sequences: self.active.len(),
+                queued_requests: self.pending.len(),
+                prefill_tokens,
+                decode_tokens,
+                chunk_budget,
+                backend_step_micros: backend_us,
+                scheduler_step_micros: scheduling_us,
+            });
+        }
         eprintln!(
             "scheduler_step step={} policy={} prefill_tokens={} decode_tokens={} members=[{}] scheduling_us={} backend_us={}",
             self.step,
             self.scheduler.name(),
-            planned
-                .iter()
-                .filter(|work| work.kind == WorkKind::Prefill)
-                .map(|work| work.tokens.len())
-                .sum::<usize>(),
-            planned
-                .iter()
-                .filter(|work| work.kind == WorkKind::Decode)
-                .map(|work| work.tokens.len())
-                .sum::<usize>(),
+            prefill_tokens,
+            decode_tokens,
             planned
                 .iter()
                 .flat_map(|work| work.tokens.iter())
@@ -767,14 +834,12 @@ impl ActiveRequest {
     }
 
     fn emit(&mut self, output: &BackendTokenEvent) -> Result<(), EndState> {
-        if let Some(fragment) = self.text.push(&output.text_bytes)? {
-            self.send(GenerationEvent::Token {
-                request_id: self.request.id,
-                token_id: output.sampled_token_id,
-                text: fragment,
-            })?;
-        }
-        Ok(())
+        let fragment = self.text.push(&output.text_bytes)?.unwrap_or_default();
+        self.send(GenerationEvent::Token {
+            request_id: self.request.id,
+            token_id: output.sampled_token_id,
+            text: fragment,
+        })
     }
 
     fn flush(&mut self, token_id: u32) -> Result<(), EndState> {
@@ -972,6 +1037,103 @@ mod tests {
             batch.iter().any(|token| token.sequence_id == SequenceId(0))
                 && batch.iter().any(|token| token.sequence_id == SequenceId(1))
         }));
+    }
+
+    #[tokio::test]
+    async fn fixed_chunk_policy_changes_actual_prefill_batches() {
+        let plans = Arc::new(Mutex::new(Vec::<Vec<BatchToken>>::new()));
+        let gate = Arc::new((Mutex::new(true), Condvar::new()));
+        let executor = RecordingGateExecutor {
+            inner: MockExecutor::new(BackendLimits {
+                max_batch_tokens: 8,
+                max_active_sequences: 1,
+                max_sequence_tokens: 128,
+            }),
+            plans: Arc::clone(&plans),
+            gate,
+            first_tokenize: AtomicBool::new(true),
+            tokenize_entered: Arc::new(AtomicBool::new(false)),
+            execute_gate: None,
+            first_execute: AtomicBool::new(true),
+        };
+        let engine = EngineHandle::spawn(
+            executor,
+            EngineConfig {
+                scheduler: SchedulerConfig::FixedChunk {
+                    prefill_chunk_tokens: 2,
+                },
+                ..config()
+            },
+        );
+        let mut input = request(32);
+        input.prompt = "ABCDE".to_owned();
+
+        let events = engine.try_generate(input).expect("request is queued");
+        let collected = collect_stream(events).await;
+        assert!(matches!(
+            collected.last(),
+            Some(GenerationEvent::Completed { .. })
+        ));
+        let recorded = plans.lock().unwrap();
+        assert_eq!(recorded[0].len(), 2);
+        assert_eq!(recorded[1].len(), 2);
+        assert_eq!(recorded[2].len(), 1);
+        assert!(!recorded[0][1].request_logits);
+        assert!(recorded[2][0].request_logits);
+    }
+
+    #[tokio::test]
+    async fn fcfs_completes_the_oldest_request_before_batching_the_next() {
+        let plans = Arc::new(Mutex::new(Vec::<Vec<BatchToken>>::new()));
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let executor = RecordingGateExecutor {
+            inner: MockExecutor::new(BackendLimits {
+                max_batch_tokens: 8,
+                max_active_sequences: 2,
+                max_sequence_tokens: 128,
+            }),
+            plans: Arc::clone(&plans),
+            gate: Arc::clone(&gate),
+            first_tokenize: AtomicBool::new(true),
+            tokenize_entered: Arc::new(AtomicBool::new(false)),
+            execute_gate: None,
+            first_execute: AtomicBool::new(true),
+        };
+        let engine = EngineHandle::spawn(
+            executor,
+            EngineConfig {
+                scheduler: SchedulerConfig::Fcfs,
+                ..config()
+            },
+        );
+        let mut first_request = request(33);
+        first_request.prompt = "AB".to_owned();
+        let mut second_request = request(34);
+        second_request.prompt = "CD".to_owned();
+        let first = engine.try_generate(first_request).expect("first is queued");
+        let second = engine
+            .try_generate(second_request)
+            .expect("second is queued");
+        let (open, wake) = &*gate;
+        *open.lock().unwrap() = true;
+        wake.notify_one();
+
+        let _ = tokio::join!(collect_stream(first), collect_stream(second));
+        let recorded = plans.lock().unwrap();
+        assert!(recorded.iter().all(|batch| {
+            batch
+                .iter()
+                .all(|token| token.sequence_id == batch[0].sequence_id)
+        }));
+        let first_second_sequence = recorded
+            .iter()
+            .position(|batch| batch[0].sequence_id == SequenceId(1))
+            .expect("second sequence is eventually scheduled");
+        assert!(
+            recorded[..first_second_sequence]
+                .iter()
+                .all(|batch| batch[0].sequence_id == SequenceId(0))
+        );
     }
 
     #[tokio::test]

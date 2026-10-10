@@ -1,0 +1,16 @@
+[package]
+name = "niniserve-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+niniserve-backend = { path = "../niniserve-backend", features = ["llamacpp"] }
+niniserve-engine = { path = "../niniserve-engine" }
+niniserve-protocol = { path = "../niniserve-protocol" }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true
