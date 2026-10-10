@@ -31,6 +31,98 @@ claim a performance improvement.
 
 Tracking issue: [#12](https://github.com/nihalmaddala/NiniServe/issues/12).
 
+### Result
+
+PASS — policy selection changes the actual engine plans, fixed chunking bounds
+total prefill work per step, and all three policies completed the real W0–W3
+matrix. Adaptive scheduling remains out of scope.
+
+### Implemented
+
+- Added `niniserve-scheduler`, a pure deterministic module with
+  `Scheduler::plan(EngineView, StepBudget) -> SchedulePlan` and an observation
+  hook reserved for feedback-driven policies.
+- Added request-at-a-time head-of-line FCFS, strict decode-priority, and fixed
+  chunked-prefill with a configurable global per-step prefill budget.
+- Replaced the engine's hard-coded one-token policy with scheduler-produced
+  multi-sequence plans and cursor-based multi-token prefill chunks.
+- Kept logits requests on each sequence's last prompt token and routed sampled
+  output by explicit sequence ID and evaluated position.
+- Added a bounded 4096-step observation ring and compact traces containing
+  policy, sequence IDs, position ranges, phases, token counts, logits
+  membership, scheduler time, and backend time.
+- Added server flags `--scheduler` and `--prefill-chunk-tokens`.
+- Added `niniserve-bench` with real tokenizer-measured W0–W3 fixtures,
+  workload-shaped warmup, JSON/CSV output, and a summary command reporting
+  nearest-rank TTFT/ITL/E2E percentiles, counts, and elapsed-window rates.
+- Made every non-EOG sampled token observable to the benchmark while keeping
+  incomplete UTF-8 bytes out of SSE text records.
+
+Strict decode-priority intentionally has no fairness guard: an indefinitely
+saturated decode budget can starve prefill. FCFS is intentionally weak and
+head-of-line blocking is expected. These limitations are baseline behavior,
+not production recommendations.
+
+### Deterministic and integration evidence
+
+```text
+cargo test -p niniserve-scheduler
+PASS — FCFS head-of-line selection, decode-first ordering, documented prefill
+starvation, fixed total chunk bounds, deterministic tie breaking, and policy
+parsing.
+
+cargo test -p niniserve-engine
+PASS — existing lifecycle/isolation/cancellation tests plus actual backend-plan
+tests for fixed prefill chunks and FCFS request-at-a-time behavior.
+
+cargo test -p niniserve-server --all-features
+PASS — HTTP behavior and scheduler CLI parsing.
+
+target/release/niniserve-bench summary results/phase3/fixed-w2
+PASS — regenerated summary.json from raw request and token-gap CSV files.
+```
+
+### Real-model baseline evidence
+
+Release runs used commit `7d7c7274144bbb4d0d82c4c791ca9c26c80cac5b`,
+`llama-cpp-2 = 0.1.159`, the ignored Qwen2.5-0.5B-Instruct Q4_K_M fixture, and
+Apple M2 Metal with 25/25 layers offloaded. The context reported `n_ctx=8192`,
+`n_ctx_seq=2048`, `n_batch=512`, `n_ubatch=128`, and `n_seq_max=4`. Model load
+was measured separately at 390–922 ms. Each measured workload followed an
+identical workload-shaped warmup.
+
+| Policy | Workload | Finished | TTFT p50/p95 ms | ITL p50/p95 ms | Window ms | Output tok/s |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| FCFS | W0 | 3/3 | 674 / 2069 | 23 / 39 | 7648 | 25.10 |
+| FCFS | W1 | 4/4 | 1794 / 4948 | 21 / 34 | 6332 | 40.43 |
+| FCFS | W2 | 3/3 | 2527 / 5592 | 21 / 32 | 6833 | 37.47 |
+| FCFS | W3 | 10/10 | 5845 / 15456 | 22 / 48 | 16905 | 32.18 |
+| Decode priority | W0 | 3/3 | 558 / 2424 | 23 / 37 | 8203 | 23.41 |
+| Decode priority | W1 | 4/4 | 170 / 170 | 43 / 58 | 2947 | 86.87 |
+| Decode priority | W2 | 3/3 | 106 / 994 | 29 / 76 | 4126 | 62.05 |
+| Decode priority | W3 | 10/10 | 1663 / 5769 | 33 / 83 | 8965 | 60.68 |
+| Fixed 128 | W0 | 3/3 | 616 / 2449 | 22 / 32 | 7588 | 25.30 |
+| Fixed 128 | W1 | 4/4 | 351 / 616 | 39 / 79 | 3408 | 75.12 |
+| Fixed 128 | W2 | 3/3 | 133 / 1138 | 33 / 133 | 4035 | 63.44 |
+| Fixed 128 | W3 | 10/10 | 2053 / 5926 | 38 / 154 | 8408 | 64.70 |
+
+All 60 measured requests completed with 0 failures. W0 prompt lengths were
+exactly 64, 512, and 1908 model tokens. W2 traces showed two decode tokens
+interleaved with each incoming long-prompt chunk. An artifact check found no
+fixed-policy scheduler step above 128 total prefill tokens.
+
+This is one run per cell on one machine. The numbers prove the harness and
+policy behavior, not statistical significance or a general speedup claim. Raw
+artifacts are intentionally ignored under `results/phase3/`; schemas and replay
+commands are in `docs/BENCHMARKING.md`.
+
+### Next task
+
+Stop after Phase 3. The smallest Phase 4 issue is an adaptive prefill-budget
+policy behind the existing `plan`/`observe` seam: use bounded, smoothed decode
+gap feedback; prove controller step response with deterministic observations;
+then compare it against multiple fixed chunk sizes on held-out W2/W3/W5 runs.
+
 ## 2026-10-10 — Issue #10 Phase 2 continuous-batching plan
 
 ### Phase and scope
