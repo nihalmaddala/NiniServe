@@ -1,7 +1,8 @@
 # Backend decision record
 
-**Status:** Phase 0 feasibility, Phase 1 serving, and the Phase 2 real
-continuous-batching gate passed on the supplied real GGUF.
+**Status:** Phase 0 feasibility, Phase 1 serving, Phase 2 real continuous
+batching, and Phase 3 real baseline-policy execution passed on the supplied
+real GGUF.
 
 ## Decision
 
@@ -114,6 +115,24 @@ not establish adaptive scheduling or comparative performance.
   memory. The production adapter must fail closed or recreate/reset context
   state instead of assuming atomic failure.
 
+## Phase 3 scheduler compatibility evidence
+
+No backend interface change or FFI shim was required for Phase 3. The existing
+`ExecutionPlan` accepts multiple contiguous explicit-position prompt tokens per
+sequence together with one pending decode token from each eligible sequence.
+Only the final prompt token requests logits, and sampled outputs remain routed
+through the original llama.cpp batch index.
+
+The release benchmark context used `n_ctx=8192`, `n_ctx_seq=2048`,
+`n_batch=512`, `n_ubatch=128`, and `n_seq_max=4` on Apple M2 Metal. All 12
+policy/workload combinations completed: request-at-a-time FCFS,
+decode-priority, and fixed chunked prefill at 128 tokens across W0–W3. The W2
+trace contained two decode tokens alongside each bounded long-prompt prefill
+chunk. Fixed-policy artifact validation found no scheduler step above its
+128-token total prefill budget. Full commands, raw schemas, and limitations are
+recorded in `docs/BENCHMARKING.md`; the ignored raw files remain under
+`results/phase3/` locally.
+
 ## Mock separation
 
 The existing deterministic mock remains the default, dependency-light backend
@@ -122,6 +141,6 @@ above, and real-model output is not used as mock performance evidence.
 
 ## Next backend task
 
-Phase 3 should add explicit baseline scheduler policies and a reproducible
-workload/metrics harness around this verified registry and batch builder.
-Adaptive control remains out of scope until those baselines are trustworthy.
+No new backend work is required for the next slice. Phase 4 can add the
+smallest measured adaptive prefill controller behind the existing scheduler
+`plan`/`observe` seam, while retaining these policies as fixed controls.

@@ -447,17 +447,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "niniserve-bench"
+version = "0.1.0"
+dependencies = [
+ "niniserve-backend",
+ "niniserve-engine",
+ "niniserve-protocol",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "niniserve-engine"
 version = "0.1.0"
 dependencies = [
  "niniserve-backend",
  "niniserve-protocol",
+ "niniserve-scheduler",
  "tokio",
 ]
 
 [[package]]
 name = "niniserve-protocol"
 version = "0.1.0"
+
+[[package]]
+name = "niniserve-scheduler"
+version = "0.1.0"
+dependencies = [
+ "niniserve-protocol",
+]
 
 [[package]]
 name = "niniserve-server"
@@ -467,6 +487,7 @@ dependencies = [
  "niniserve-backend",
  "niniserve-engine",
  "niniserve-protocol",
+ "niniserve-scheduler",
  "serde",
  "tokio",
  "tokio-stream",

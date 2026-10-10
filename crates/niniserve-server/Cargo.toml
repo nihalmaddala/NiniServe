@@ -13,6 +13,7 @@ axum = { workspace = true, features = ["json", "tokio", "http1"] }
 niniserve-backend = { path = "../niniserve-backend" }
 niniserve-engine = { path = "../niniserve-engine" }
 niniserve-protocol = { path = "../niniserve-protocol" }
+niniserve-scheduler = { path = "../niniserve-scheduler" }
 serde = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal"] }
 tokio-stream = { workspace = true }

@@ -12,7 +12,8 @@ time-to-first-token, inter-token latency, throughput, and fairness.
 ## Project status
 
 NiniServe has passed **Phase 0 backend feasibility**, the **Phase 1 serving
-foundation**, and the narrow **Phase 2 continuous-batching gate**. The
+foundation**, the **Phase 2 continuous-batching gate**, and the **Phase 3
+baseline-scheduler gate**. The
 repository contains a real `llama-cpp-2` adapter, one dedicated engine thread,
 bounded command/event queues, and an Axum server that streams two active
 requests while NiniServe constructs their shared execution batches. The
@@ -21,8 +22,9 @@ deterministic mock remains the default backend for ordinary tests.
 The supplied Qwen2.5 0.5B GGUF has generated two isolated concurrent streams on
 Apple M2 Metal. Batch traces prove both dense sequence IDs entered the same
 prefill and decode calls; disconnect cancellation, a 120-second engine timeout,
-and released-slot reuse are implemented. Scheduler policies, adaptive control,
-and benchmark claims remain later work.
+and released-slot reuse are implemented. Three explicit non-adaptive scheduler
+policies and a release-mode W0–W3 measurement harness now provide the baseline
+for later adaptive work. Adaptive control remains unimplemented.
 
 The canonical requirements and phase gates are in
 [`NINISERVE_MASTER_SPEC.md`](NINISERVE_MASTER_SPEC.md). Coding agents must also
@@ -38,9 +40,8 @@ follow [`AGENTS.md`](AGENTS.md).
 4. Phase 2 adds a bounded FCFS queue, two active dense backend slots, shared
    batch construction, independent streams/samplers, cancellation, timeouts,
    and slot reuse.
-
-Later scheduling and benchmark work begins only after the relevant phase gates
-pass.
+5. Phase 3 adds request-at-a-time FCFS, decode-priority, fixed chunked prefill,
+   structured step observations, and real-model W0–W3 result artifacts.
 
 ## Development workflow
 
@@ -101,7 +102,9 @@ The workspace currently contains:
   implementation plus a feature-gated real llama.cpp adapter;
 - `niniserve-engine`: the exclusive synchronous model owner with bounded
   commands and per-request events;
+- `niniserve-scheduler`: pure snapshot-to-plan baseline scheduling policies;
 - `niniserve-server`: the Axum routes and feature-gated `niniserve` binary.
+- `niniserve-bench`: release-mode real-model workload and summary commands.
 
 See [`docs/BACKEND_DECISION.md`](docs/BACKEND_DECISION.md) for the boundary
 between mock, real-backend, and serving evidence.
@@ -113,6 +116,8 @@ Build and start with a user-supplied GGUF:
 ```bash
 cargo run -p niniserve-server --features llamacpp --bin niniserve -- \
   --model models/qwen2.5-0.5b-instruct-q4_k_m.gguf \
+  --scheduler fixed-chunk \
+  --prefill-chunk-tokens 128 \
   --port 8080
 ```
 
@@ -128,9 +133,12 @@ curl -N http://127.0.0.1:8080/v1/completions \
 
 The completion endpoint is intentionally OpenAI-inspired, not fully
 OpenAI-compatible. It requires `stream: true`, uses a fixed model ID of
-`local-gguf`, and currently supports at most two active generations. The engine
-uses a deliberately simple one-token-per-active-sequence batch policy; named
-scheduler policies are not implemented yet.
+`local-gguf`, and currently supports at most two active generations. Available
+policies are `fcfs`, `decode-priority`, and `fixed-chunk`; the last accepts a
+positive `--prefill-chunk-tokens` value.
+
+See [`docs/BENCHMARKING.md`](docs/BENCHMARKING.md) for the W0–W3 workload
+definitions, exact result schemas, release commands, and measurement caveats.
 
 ## Scope boundary
 

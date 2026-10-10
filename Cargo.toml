@@ -1,8 +1,10 @@
 [workspace]
 members = [
     "crates/niniserve-backend",
+    "crates/niniserve-bench",
     "crates/niniserve-engine",
     "crates/niniserve-protocol",
+    "crates/niniserve-scheduler",
     "crates/niniserve-server",
 ]
 resolver = "3"
@@ -15,6 +17,7 @@ rust-version = "1.97.1"
 [workspace.dependencies]
 axum = { version = "=0.8.9" }
 serde = { version = "=1.0.229" }
+serde_json = { version = "=1.0.151" }
 tokio = { version = "=1.53.2" }
 tokio-stream = { version = "=0.1.19" }
 tower = { version = "=0.5.3" }
