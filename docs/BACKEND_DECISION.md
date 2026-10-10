@@ -1,7 +1,7 @@
 # Backend decision record
 
-**Status:** Phase 0 feasibility gate and Phase 1 single-request serving gate
-passed on the supplied real GGUF.
+**Status:** Phase 0 feasibility, Phase 1 serving, and the Phase 2 real
+continuous-batching gate passed on the supplied real GGUF.
 
 ## Decision
 
@@ -75,6 +75,28 @@ so the final handle closes the bounded command channel and joins the engine
 thread before backend destruction. The repeated Ctrl-C shutdown then exited
 with status 0 after `ggml_metal_free: deallocating`.
 
+## Phase 2 shared-context evidence
+
+The serving configuration now uses `n_ctx=4096`, `n_ctx_seq=2048`,
+`n_batch=512`, `n_ubatch=128`, and `n_seq_max=2`. The engine assigns dense
+backend slots 0 and 1, advances one explicit-position token per active sequence
+per step, and routes sampled results by sequence ID. This simple FCFS mechanism
+is correctness scaffolding, not a named scheduling policy.
+
+Two concurrent real HTTP requests generated distinct prompt-appropriate SSE
+streams and ended with `finish_reason: length` plus `[DONE]`. Trace steps 0–13
+contained both `seq:0` and `seq:1`; steps 5–13 contained two decode tokens in
+the same llama.cpp call. Observed planning time was 1–6 microseconds while the
+corresponding backend calls took 13,132–47,053 microseconds after initial
+pipeline compilation. These are raw observations from one local smoke run, not
+benchmark or speedup claims.
+
+A second real run disconnected sequence 0 after two streamed fragments.
+Sequence 1 continued alone through completion, and the following request reused
+sequence slot 0 from position 0. Graceful shutdown again exited 0 after Metal
+deallocation. This establishes the cancellation/isolation/reuse gate; it does
+not establish adaptive scheduling or comparative performance.
+
 ## Adapter invariants discovered
 
 - The sampler/logits index is the exact original batch-token index passed to
@@ -95,12 +117,11 @@ with status 0 after `ggml_metal_free: deallocating`.
 ## Mock separation
 
 The existing deterministic mock remains the default, dependency-light backend
-for architecture tests. Its nine tests are not included in the real-model proof
+for architecture tests. Mock tests are not included in the real-model proof
 above, and real-model output is not used as mock performance evidence.
 
 ## Next backend task
 
-Phase 2 should add the smallest active-sequence registry and multi-request
-batch builder around this adapter, with explicit cancellation commands and
-batch traces. Do not begin scheduler-policy or adaptive-controller work until
-real concurrent request isolation and cleanup pass.
+Phase 3 should add explicit baseline scheduler policies and a reproducible
+workload/metrics harness around this verified registry and batch builder.
+Adaptive control remains out of scope until those baselines are trustworthy.

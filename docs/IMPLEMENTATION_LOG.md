@@ -3,6 +3,123 @@
 This log records verified work, command outcomes, blockers, and the next scoped
 task. It is not a roadmap completion claim.
 
+## 2026-10-10 — Issue #10 Phase 2 continuous-batching plan
+
+### Phase and scope
+
+Phase 2 multi-request continuous batching on
+`feat/phase2-continuous-batching`. This milestone adds the smallest explicit
+active registry, shared batch builder, and cancellation path needed to pass the
+real two-request gate. Scheduler-policy abstractions, adaptive prefill control,
+MTP/speculative decoding, and performance claims remain out of scope.
+
+### Plan
+
+1. Replace the request-at-a-time engine loop with a deterministic bounded
+   pending queue and active registry that assigns dense backend sequence slots.
+2. Build shared execution plans from explicit per-sequence positions while
+   preserving exact logits routing, independent sampler state, and bounded
+   per-request output delivery.
+3. Add explicit cancellation/disconnect handling with exactly-once model-memory
+   cleanup and safe dense-slot reuse; one cancelled request must not stop its
+   peers.
+4. Add deterministic mock tests first for shared-batch interleaving, isolation,
+   cancellation, overload, cleanup, and reuse, then update HTTP integration.
+5. Run two real concurrent SSE requests against the ignored Qwen GGUF, retain
+   batch trace evidence, and record raw scheduling overhead without presenting
+   it as a benchmark.
+6. Run formatting, warnings-denied Clippy, workspace tests, and native-feature
+   checks; update backend/user docs and complete PR/CI only when the gate passes.
+
+Tracking issue: [#10](https://github.com/nihalmaddala/NiniServe/issues/10).
+
+### Result
+
+PASS — two real HTTP requests were simultaneously active in one llama.cpp
+context, shared prefill/decode batches, produced isolated SSE output, and
+completed normally. A separate real disconnect test cancelled one stream while
+its peer continued, then proved the released dense slot was reusable.
+
+### Implemented
+
+- Replaced the request-at-a-time loop with a bounded FCFS pending queue and an
+  active registry keyed by dense backend `SequenceId` slots.
+- Added shared batch construction with one explicit-position token per active
+  sequence per step. Prefill and decode tokens may coexist in one batch.
+- Added independent request phases, sampler initialization, logits/result
+  routing, UTF-8 streaming, EOG/max-token completion, and fail-closed errors.
+- Added disconnect and explicit cancellation, terminal cancellation/timeout
+  events, a 120-second serving timeout, and exactly-once cleanup.
+- Added bounded overload rejection, per-sequence context validation, slot
+  poisoning on cleanup failure, and ascending dense-slot reuse.
+- Increased real serving configuration to `n_ctx=4096`, `n_ctx_seq=2048`,
+  `n_batch=512`, `n_ubatch=128`, and `n_seq_max=2`.
+- Added traces with sequence ID, position, prefill/decode phase, logits
+  membership, planning microseconds, and backend microseconds.
+
+This is a simple correctness policy, not a Phase 3 scheduler implementation,
+adaptive prefill scheduling, or a performance optimization claim.
+
+### Mock and integration evidence
+
+```text
+cargo test -p niniserve-engine -p niniserve-server
+PASS — shared batches without output mixing; cancellation preserves a peer and
+permits slot reuse; bounded overload; context rejection; timeout; teardown; and
+HTTP streaming/validation/post-header errors.
+
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+PASS after the Phase 2 implementation.
+```
+
+### Real-model evidence
+
+```text
+target/debug/niniserve \
+  --model models/qwen2.5-0.5b-instruct-q4_k_m.gguf --port 18080
+PASS outside the restricted sandbox — Apple M2 Metal, 25/25 layers offloaded,
+n_ctx=4096, n_ctx_seq=2048, n_batch=512, n_ubatch=128, n_seq_max=2.
+
+Concurrent greedy requests, 12 tokens each
+PASS — both HTTP 200; both emitted 12 isolated fragments, finish_reason
+"length", and [DONE]. Observed outputs began " that it is a statically typed
+language" and " be used to infer the probability of a hypothesis".
+
+Shared trace
+PASS — steps 0..13 contained both seq:0 and seq:1; steps 5..13 contained decode
+tokens for both in each llama.cpp call. Planning observations were 1..6 us and
+backend observations after pipeline compilation were 13,132..47,053 us. This
+single smoke run is not a benchmark.
+
+Disconnect/cancellation
+PASS — seq:0 disconnected after 2 fragments; seq:1 continued to 24 fragments
+and [DONE]. Trace dropped seq:0 after step 26 while seq:1 continued through step
+44. A later request reused seq:0 at position 0 and completed with [DONE].
+
+Ctrl-C shutdown
+PASS — exit 0; Metal context deallocated cleanly.
+```
+
+### Remaining workflow
+
+```text
+cargo fmt --all -- --check
+PASS.
+
+cargo clippy --workspace --all-targets -- -D warnings
+PASS.
+
+cargo test --workspace
+PASS — 20 unit tests; 0 failed; doc tests passed (0 tests).
+
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+PASS — includes the native llama.cpp adapter and server binary.
+```
+
+Git commits, PR, and CI results are recorded after they occur. Stop after Phase
+2; the next issue is the smallest Phase 3 baseline scheduler and measurement
+slice, not adaptive control.
+
 ## 2026-10-09 — Issue #8 Phase 1 vertical-slice plan
 
 ### Phase and scope

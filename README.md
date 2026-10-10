@@ -11,16 +11,18 @@ time-to-first-token, inter-token latency, throughput, and fairness.
 
 ## Project status
 
-NiniServe has passed **Phase 0 backend feasibility** and now has the **Phase 1
-single-request serving foundation**. The repository contains a real
-`llama-cpp-2` adapter, one dedicated engine thread, bounded command/event
-channels, and an Axum server that streams one request at a time over SSE. The
+NiniServe has passed **Phase 0 backend feasibility**, the **Phase 1 serving
+foundation**, and the narrow **Phase 2 continuous-batching gate**. The
+repository contains a real `llama-cpp-2` adapter, one dedicated engine thread,
+bounded command/event queues, and an Axum server that streams two active
+requests while NiniServe constructs their shared execution batches. The
 deterministic mock remains the default backend for ordinary tests.
 
-The supplied Qwen2.5 0.5B GGUF has generated real output on Apple M2 Metal.
-This is not yet a multi-request server: continuous batching, explicit
-cancellation commands, timeouts, scheduler policies, and adaptive control are
-later phases.
+The supplied Qwen2.5 0.5B GGUF has generated two isolated concurrent streams on
+Apple M2 Metal. Batch traces prove both dense sequence IDs entered the same
+prefill and decode calls; disconnect cancellation, a 120-second engine timeout,
+and released-slot reuse are implemented. Scheduler policies, adaptive control,
+and benchmark claims remain later work.
 
 The canonical requirements and phase gates are in
 [`NINISERVE_MASTER_SPEC.md`](NINISERVE_MASTER_SPEC.md). Coding agents must also
@@ -32,9 +34,10 @@ follow [`AGENTS.md`](AGENTS.md).
 2. The standalone real-model probe proved two explicit sequences in one
    context with correct logits routing and cleanup.
 3. The Phase 1 service loads one GGUF, generates on its exclusive engine
-   thread, streams SSE, and releases the sequence for the next request.
-4. The next phase is actual multi-request continuous batching. It is not
-   implemented or claimed here.
+   thread, streams SSE, and releases sequence state.
+4. Phase 2 adds a bounded FCFS queue, two active dense backend slots, shared
+   batch construction, independent streams/samplers, cancellation, timeouts,
+   and slot reuse.
 
 Later scheduling and benchmark work begins only after the relevant phase gates
 pass.
@@ -124,8 +127,10 @@ curl -N http://127.0.0.1:8080/v1/completions \
 ```
 
 The completion endpoint is intentionally OpenAI-inspired, not fully
-OpenAI-compatible. Phase 1 requires `stream: true`, uses a fixed model ID of
-`local-gguf`, and supports one active generation at a time.
+OpenAI-compatible. It requires `stream: true`, uses a fixed model ID of
+`local-gguf`, and currently supports at most two active generations. The engine
+uses a deliberately simple one-token-per-active-sequence batch policy; named
+scheduler policies are not implemented yet.
 
 ## Scope boundary
 
