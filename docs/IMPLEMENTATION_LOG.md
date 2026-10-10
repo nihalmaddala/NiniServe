@@ -3,6 +3,34 @@
 This log records verified work, command outcomes, blockers, and the next scoped
 task. It is not a roadmap completion claim.
 
+## 2026-10-10 — Issue #12 Phase 3 baseline-scheduler plan
+
+### Phase and scope
+
+Phase 3 baseline scheduler policies and measurement on
+`feat/phase3-baseline-schedulers`. This milestone establishes repeatable
+non-adaptive comparisons; it does not implement the adaptive controller or
+claim a performance improvement.
+
+### Plan
+
+1. Add a pure scheduler module whose public seam accepts an immutable engine
+   snapshot and token budget and returns a deterministic execution plan.
+2. Use red-green slices to implement request-at-a-time FCFS, decode-priority,
+   and fixed chunked-prefill policies, including deterministic ordering and
+   explicit starvation semantics.
+3. Integrate selected plans into the exclusive-owner engine so policy changes
+   alter actual multi-sequence batch membership and prefill chunk sizes without
+   exposing backend details outside `niniserve-backend`.
+4. Add structured scheduler-step observations and server configuration for the
+   policy and fixed-prefill chunk size.
+5. Add W0–W3 workload generation, machine-readable JSON/CSV artifacts, and a
+   summary command using measured values only.
+6. Run policy experiments with the ignored Qwen GGUF, record mock and real-model
+   evidence separately, and complete formatting, Clippy, tests, PR, and CI.
+
+Tracking issue: [#12](https://github.com/nihalmaddala/NiniServe/issues/12).
+
 ## 2026-10-10 — Issue #10 Phase 2 continuous-batching plan
 
 ### Phase and scope
