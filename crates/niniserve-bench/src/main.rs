@@ -123,10 +123,18 @@ struct TokenGap {
 struct Summary {
     request_count: usize,
     finished_count: usize,
+    failed_count: usize,
+    total_output_tokens: usize,
+    elapsed_window_ms: u128,
     ttft_p50_ms: Option<u128>,
     ttft_p95_ms: Option<u128>,
+    itl_sample_count: usize,
+    itl_p50_ms: Option<u128>,
+    itl_p95_ms: Option<u128>,
     e2e_p50_ms: Option<u128>,
     e2e_p95_ms: Option<u128>,
+    output_tokens_per_second: Option<f64>,
+    requests_per_second: Option<f64>,
 }
 
 #[tokio::main]
@@ -260,9 +268,10 @@ async fn run(config: RunConfig) -> Result<(), Box<dyn Error>> {
             request
         })
         .collect();
-    execute_requests(&engine, warmup, config.scheduler).await?;
+    let serial = matches!(config.workload, Workload::W0);
+    execute_requests(&engine, warmup, config.scheduler, serial).await?;
     let _ = engine.take_step_observations();
-    let results = execute_requests(&engine, requests, config.scheduler).await?;
+    let results = execute_requests(&engine, requests, config.scheduler, serial).await?;
     let steps = engine.take_step_observations();
     let metadata = Metadata {
         run_id: &run_id,
@@ -299,8 +308,20 @@ async fn execute_requests(
     engine: &EngineHandle,
     requests: Vec<RequestSpec>,
     scheduler: SchedulerConfig,
+    serial: bool,
 ) -> Result<Vec<RequestResult>, Box<dyn Error>> {
     let run_started = Instant::now();
+    if serial {
+        let mut results = Vec::with_capacity(requests.len());
+        for request in requests {
+            results.push(
+                measure_request(engine.clone(), request, scheduler, run_started)
+                    .await
+                    .map_err(std::io::Error::other)?,
+            );
+        }
+        return Ok(results);
+    }
     let mut tasks = Vec::with_capacity(requests.len());
     for request in requests {
         tasks.push(tokio::spawn(measure_request(
@@ -409,7 +430,7 @@ fn workload_requests(
     executor: &LlamaCppExecutor,
 ) -> Result<Vec<RequestSpec>, Box<dyn Error>> {
     let shapes: Vec<(usize, u32, u64)> = match workload {
-        Workload::W0 => vec![(256, 64, 0)],
+        Workload::W0 => vec![(56, 64, 0), (504, 64, 0), (1_900, 64, 0)],
         Workload::W1 => vec![(32, 64, 0); 4],
         Workload::W2 => vec![(32, 96, 0), (32, 96, 0), (850, 64, 75)],
         Workload::W3 => (0..10)
@@ -558,14 +579,24 @@ fn summary_from_results(results: &[RequestResult]) -> Summary {
         .iter()
         .map(|result| result.e2e_ms)
         .collect::<Vec<_>>();
-    Summary {
-        request_count: results.len(),
-        finished_count: results.iter().filter(|result| result.finished).count(),
-        ttft_p50_ms: percentile(ttft.clone(), 50),
-        ttft_p95_ms: percentile(ttft, 95),
-        e2e_p50_ms: percentile(e2e.clone(), 50),
-        e2e_p95_ms: percentile(e2e, 95),
-    }
+    let itl = results
+        .iter()
+        .flat_map(|result| &result.token_gaps)
+        .filter_map(|gap| gap.itl_ms)
+        .collect::<Vec<_>>();
+    build_summary(
+        results.len(),
+        results.iter().filter(|result| result.finished).count(),
+        results.iter().map(|result| result.output_tokens).sum(),
+        results
+            .iter()
+            .map(|result| result.arrival_ms + result.e2e_ms)
+            .max()
+            .unwrap_or(0),
+        ttft,
+        itl,
+        e2e,
+    )
 }
 
 fn percentile(mut values: Vec<u128>, percentile: usize) -> Option<u128> {
@@ -573,14 +604,47 @@ fn percentile(mut values: Vec<u128>, percentile: usize) -> Option<u128> {
         return None;
     }
     values.sort_unstable();
-    let index = (values.len() - 1) * percentile / 100;
+    let index = (values.len() * percentile).div_ceil(100).saturating_sub(1);
     values.get(index).copied()
+}
+
+fn build_summary(
+    request_count: usize,
+    finished_count: usize,
+    total_output_tokens: usize,
+    elapsed_window_ms: u128,
+    ttft: Vec<u128>,
+    itl: Vec<u128>,
+    e2e: Vec<u128>,
+) -> Summary {
+    let elapsed_seconds =
+        Duration::from_millis(u64::try_from(elapsed_window_ms).unwrap_or(u64::MAX)).as_secs_f64();
+    Summary {
+        request_count,
+        finished_count,
+        failed_count: request_count.saturating_sub(finished_count),
+        total_output_tokens,
+        elapsed_window_ms,
+        ttft_p50_ms: percentile(ttft.clone(), 50),
+        ttft_p95_ms: percentile(ttft, 95),
+        itl_sample_count: itl.len(),
+        itl_p50_ms: percentile(itl.clone(), 50),
+        itl_p95_ms: percentile(itl, 95),
+        e2e_p50_ms: percentile(e2e.clone(), 50),
+        e2e_p95_ms: percentile(e2e, 95),
+        output_tokens_per_second: (elapsed_seconds > 0.0)
+            .then_some(total_output_tokens as f64 / elapsed_seconds),
+        requests_per_second: (elapsed_seconds > 0.0)
+            .then_some(finished_count as f64 / elapsed_seconds),
+    }
 }
 
 fn summarize(input: &Path) -> Result<(), Box<dyn Error>> {
     let file = File::open(input.join("requests.csv"))?;
     let mut ttft = Vec::new();
     let mut e2e = Vec::new();
+    let mut total_output_tokens = 0;
+    let mut elapsed_window_ms = 0;
     let mut request_count = 0;
     let mut finished_count = 0;
     for line in BufReader::new(file).lines().skip(1) {
@@ -593,19 +657,36 @@ fn summarize(input: &Path) -> Result<(), Box<dyn Error>> {
         if columns[8] == "true" {
             finished_count += 1;
         }
+        total_output_tokens += columns[3].parse::<usize>()?;
         if let Ok(value) = columns[6].parse() {
             ttft.push(value);
         }
-        e2e.push(columns[7].parse()?);
+        let arrival = columns[4].parse::<u128>()?;
+        let request_e2e = columns[7].parse::<u128>()?;
+        elapsed_window_ms = elapsed_window_ms.max(arrival + request_e2e);
+        e2e.push(request_e2e);
     }
-    let summary = Summary {
+    let gaps = File::open(input.join("token_gaps.csv"))?;
+    let mut itl = Vec::new();
+    for line in BufReader::new(gaps).lines().skip(1) {
+        let line = line?;
+        let columns = line.split(',').collect::<Vec<_>>();
+        if columns.len() != 4 {
+            return Err(format!("invalid token_gaps.csv row: {line}").into());
+        }
+        if let Ok(value) = columns[3].parse() {
+            itl.push(value);
+        }
+    }
+    let summary = build_summary(
         request_count,
         finished_count,
-        ttft_p50_ms: percentile(ttft.clone(), 50),
-        ttft_p95_ms: percentile(ttft, 95),
-        e2e_p50_ms: percentile(e2e.clone(), 50),
-        e2e_p95_ms: percentile(e2e, 95),
-    };
+        total_output_tokens,
+        elapsed_window_ms,
+        ttft,
+        itl,
+        e2e,
+    );
     write_json(&input.join("summary.json"), &summary)?;
     println!("{}", serde_json::to_string_pretty(&summary)?);
     Ok(())
@@ -656,7 +737,7 @@ mod tests {
     #[test]
     fn percentiles_are_measured_samples() {
         assert_eq!(percentile(vec![40, 10, 30, 20], 50), Some(20));
-        assert_eq!(percentile(vec![40, 10, 30, 20], 95), Some(30));
+        assert_eq!(percentile(vec![40, 10, 30, 20], 95), Some(40));
         assert_eq!(percentile(Vec::new(), 95), None);
     }
 }
