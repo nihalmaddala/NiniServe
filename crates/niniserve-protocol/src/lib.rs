@@ -43,6 +43,12 @@ pub enum GenerationEvent {
         request_id: RequestId,
         finish_reason: FinishReason,
     },
+    Cancelled {
+        request_id: RequestId,
+    },
+    TimedOut {
+        request_id: RequestId,
+    },
     Error {
         request_id: RequestId,
         message: String,
@@ -51,8 +57,26 @@ pub enum GenerationEvent {
 
 impl GenerationEvent {
     #[must_use]
+    pub const fn request_id(&self) -> RequestId {
+        match self {
+            Self::Started { request_id }
+            | Self::Token { request_id, .. }
+            | Self::Completed { request_id, .. }
+            | Self::Cancelled { request_id }
+            | Self::TimedOut { request_id }
+            | Self::Error { request_id, .. } => *request_id,
+        }
+    }
+
+    #[must_use]
     pub const fn is_terminal(&self) -> bool {
-        matches!(self, Self::Completed { .. } | Self::Error { .. })
+        matches!(
+            self,
+            Self::Completed { .. }
+                | Self::Cancelled { .. }
+                | Self::TimedOut { .. }
+                | Self::Error { .. }
+        )
     }
 }
 

@@ -16,6 +16,7 @@ pub mod llamacpp;
 pub struct BackendLimits {
     pub max_batch_tokens: usize,
     pub max_active_sequences: usize,
+    pub max_sequence_tokens: usize,
 }
 
 /// One token submitted at an explicit model position for an explicit sequence.

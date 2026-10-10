@@ -19,7 +19,7 @@ use axum::{
     },
     routing::{get, post},
 };
-use niniserve_engine::{EngineHandle, EngineSubmitError};
+use niniserve_engine::{EngineHandle, EngineSubmitError, GenerationStream};
 use niniserve_protocol::{
     FinishReason, GenerationEvent, GenerationRequest, RequestId, RequestLimits,
 };
@@ -131,7 +131,7 @@ async fn completions(
 }
 
 async fn forward_sse(
-    mut engine_events: mpsc::Receiver<GenerationEvent>,
+    mut engine_events: GenerationStream,
     output: mpsc::Sender<Result<Event, Infallible>>,
     model: String,
 ) {
@@ -162,6 +162,22 @@ async fn forward_sse(
                         FinishReason::Length => "length",
                     }),
                 ),
+                true,
+                true,
+            ),
+            GenerationEvent::Cancelled { request_id } => (
+                completion_event(
+                    request_id,
+                    &model,
+                    created,
+                    String::new(),
+                    Some("cancelled"),
+                ),
+                true,
+                true,
+            ),
+            GenerationEvent::TimedOut { request_id } => (
+                completion_event(request_id, &model, created, String::new(), Some("timeout")),
                 true,
                 true,
             ),
@@ -278,9 +294,11 @@ mod tests {
         body::{Body, to_bytes},
         http::{Request, StatusCode, header},
     };
-    use niniserve_backend::{BackendLimits, MockExecutor};
+    use niniserve_backend::{
+        BackendError, BackendLimits, BackendTokenEvent, ExecutionPlan, MockExecutor, ModelExecutor,
+    };
     use niniserve_engine::{EngineConfig, EngineHandle};
-    use niniserve_protocol::RequestLimits;
+    use niniserve_protocol::{RequestLimits, SequenceId};
     use tower::ServiceExt;
 
     use super::router;
@@ -290,10 +308,13 @@ mod tests {
             MockExecutor::new(BackendLimits {
                 max_batch_tokens: 64,
                 max_active_sequences: 1,
+                max_sequence_tokens: 128,
             }),
             EngineConfig {
                 command_capacity: 2,
+                pending_capacity: 2,
                 event_capacity: 8,
+                request_timeout: std::time::Duration::from_secs(30),
             },
         );
         router(
@@ -365,13 +386,12 @@ mod tests {
     #[tokio::test]
     async fn backend_errors_after_headers_are_explicit_sse_errors_without_done() {
         let engine = EngineHandle::spawn(
-            MockExecutor::new(BackendLimits {
-                max_batch_tokens: 1,
-                max_active_sequences: 1,
-            }),
+            FailingExecutor,
             EngineConfig {
                 command_capacity: 1,
+                pending_capacity: 1,
                 event_capacity: 4,
+                request_timeout: std::time::Duration::from_secs(30),
             },
         );
         let response = router(
@@ -385,7 +405,7 @@ mod tests {
             Request::post("/v1/completions")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
-                    r#"{"model":"local-gguf","prompt":"AB","max_tokens":3,"temperature":0.0,"stream":true}"#,
+                    r#"{"model":"local-gguf","prompt":"A","max_tokens":3,"temperature":0.0,"stream":true}"#,
                 ))
                 .unwrap(),
         )
@@ -396,7 +416,34 @@ mod tests {
         let body = to_bytes(response.into_body(), 8_192).await.unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
         assert!(body.starts_with("event: error\n"));
-        assert!(body.contains("backend batch limit is 1"));
+        assert!(body.contains("synthetic decode failure"));
         assert!(!body.contains("[DONE]"));
+    }
+
+    struct FailingExecutor;
+
+    impl ModelExecutor for FailingExecutor {
+        fn tokenize(&self, _prompt: &str) -> Result<Vec<u32>, BackendError> {
+            Ok(vec![1])
+        }
+
+        fn execute(
+            &mut self,
+            _plan: &ExecutionPlan,
+        ) -> Result<Vec<BackendTokenEvent>, BackendError> {
+            Err(BackendError::Native("synthetic decode failure".to_owned()))
+        }
+
+        fn release_sequence(&mut self, _sequence_id: SequenceId) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn limits(&self) -> BackendLimits {
+            BackendLimits {
+                max_batch_tokens: 1,
+                max_active_sequences: 1,
+                max_sequence_tokens: 8,
+            }
+        }
     }
 }
