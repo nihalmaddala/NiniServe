@@ -50,14 +50,17 @@ impl ServerConfig {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let config = ServerConfig::parse()?;
-    let executor = LlamaCppExecutor::load(&LlamaCppConfig::single_request(&config.model_path))?;
+    let backend_config = LlamaCppConfig::two_requests(&config.model_path);
+    let executor = LlamaCppExecutor::load(&backend_config)?;
     let gpu_offload_supported = executor.gpu_offload_supported();
     let context_limits = executor.context_limits();
     let engine = EngineHandle::spawn(
         executor,
         EngineConfig {
             command_capacity: 16,
+            pending_capacity: 16,
             event_capacity: 32,
+            request_timeout: std::time::Duration::from_secs(120),
         },
     );
     let app = router(
@@ -70,8 +73,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), config.port);
     let listener = tokio::net::TcpListener::bind(address).await?;
     println!(
-        "NiniServe listening on http://{address}; gpu_offload_supported={gpu_offload_supported}; n_ctx={} n_batch={} n_ubatch={}",
-        context_limits.0, context_limits.1, context_limits.2
+        "NiniServe listening on http://{address}; gpu_offload_supported={gpu_offload_supported}; n_ctx={} n_ctx_seq={} n_batch={} n_ubatch={} n_seq_max={}",
+        context_limits.0,
+        context_limits.0 / backend_config.n_seq_max,
+        context_limits.1,
+        context_limits.2,
+        backend_config.n_seq_max
     );
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())

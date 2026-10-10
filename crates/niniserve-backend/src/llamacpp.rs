@@ -57,6 +57,18 @@ impl LlamaCppConfig {
             gpu_layers: u32::MAX,
         }
     }
+
+    #[must_use]
+    pub fn two_requests(model_path: impl Into<PathBuf>) -> Self {
+        Self {
+            model_path: model_path.into(),
+            n_ctx: 4_096,
+            n_batch: 512,
+            n_ubatch: 128,
+            n_seq_max: 2,
+            gpu_layers: u32::MAX,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -96,6 +108,10 @@ impl LlamaCppExecutor {
                 .map_err(|error| native_operation("convert n_batch", error))?,
             max_active_sequences: usize::try_from(config.n_seq_max)
                 .map_err(|error| native_operation("convert n_seq_max", error))?,
+            max_sequence_tokens: usize::try_from(runtime.borrow_dependent().n_ctx())
+                .map_err(|error| native_operation("convert n_ctx", error))?
+                / usize::try_from(config.n_seq_max)
+                    .map_err(|error| native_operation("convert n_seq_max", error))?,
         };
         Ok(Self {
             runtime,

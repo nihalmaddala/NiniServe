@@ -139,6 +139,7 @@ mod tests {
         MockExecutor::new(BackendLimits {
             max_batch_tokens: 4,
             max_active_sequences: 2,
+            max_sequence_tokens: 32,
         })
     }
 
