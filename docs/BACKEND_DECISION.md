@@ -1,8 +1,9 @@
 # Backend decision record
 
 **Status:** Phase 0 feasibility, Phase 1 serving, Phase 2 real continuous
-batching, and Phase 3 real baseline-policy execution passed on the supplied
-real GGUF.
+batching, Phase 3 real baseline-policy execution, and the Phase 4 adaptive
+controller experiment passed on the supplied real GGUF. Phase 4 produced a
+negative comparative-performance result.
 
 ## Decision
 
@@ -139,8 +140,35 @@ The existing deterministic mock remains the default, dependency-light backend
 for architecture tests. Mock tests are not included in the real-model proof
 above, and real-model output is not used as mock performance evidence.
 
+## Phase 4 adaptive compatibility and result
+
+No backend API, dependency, or FFI change was needed. The engine timestamps
+each non-EOG sample when `ModelExecutor::execute` returns, stores the prior
+timestamp independently per active sequence, and feeds the maximum gap from a
+step into the scheduler. This is a server-side token-ready signal: it includes
+backend execution and intervening scheduled work but excludes HTTP forwarding
+and network delay. The benchmark continues to report client-side engine-event
+ITL separately.
+
+The pinned backend executed all fixed-64/128/256/512 and adaptive W2/W3/W5
+runs on Apple M2 Metal. All 285 measured requests completed. The adaptive
+controller exercised its complete 32–512 token range, interleaved real decode
+and prefill work, and emitted raw gap/EWMA/decision traces. It did not beat the
+best fixed control: adaptive output throughput was 74.49/78.78/71.31 tokens/s
+on W2/W3/W5, versus the best fixed result of 81.23/88.71/82.89 tokens/s.
+Adaptive p95 TTFT was also worse than the best fixed result on all three
+workloads. Therefore the experiment validates backend compatibility and
+observability, not adaptive performance superiority.
+
+The fairness timer is measured from original enqueue time for active prefills,
+but `n_seq_max=4` limits which requests can become active. llama.cpp decode
+calls are also non-preemptive, so a 500 ms scheduler threshold is checked only
+between calls and is not a hard end-to-end wait bound. Addressing admission
+fairness or preemption would be engine/scheduling work, not a backend-binding
+change.
+
 ## Next backend task
 
-No new backend work is required for the next slice. Phase 4 can add the
-smallest measured adaptive prefill controller behind the existing scheduler
-`plan`/`observe` seam, while retaining these policies as fixed controls.
+No new backend work is required for the next slice. Phase 5 should focus on
+robustness and reproducible reporting while preserving the pinned adapter and
+the measured scheduler controls.
