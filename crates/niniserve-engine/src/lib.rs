@@ -16,7 +16,8 @@ use niniserve_backend::{
 };
 use niniserve_protocol::{FinishReason, GenerationEvent, GenerationRequest, RequestId, SequenceId};
 use niniserve_scheduler::{
-    BaselineScheduler, EngineView, Scheduler, SequencePhase, SequenceSnapshot, StepBudget, WorkKind,
+    ConfiguredScheduler, EngineView, Scheduler, SequencePhase, SequenceSnapshot, StepBudget,
+    WorkKind,
 };
 use tokio::sync::mpsc;
 
@@ -34,11 +35,16 @@ pub struct EngineStepObservation {
     pub prefill_tokens: usize,
     pub decode_tokens: usize,
     pub chunk_budget: Option<usize>,
+    pub next_chunk_budget: Option<usize>,
+    pub observed_decode_gap_micros: Option<u128>,
+    pub decode_gap_ewma_micros: Option<u128>,
+    pub adaptive_plan_reason: Option<&'static str>,
+    pub adaptive_decision: Option<&'static str>,
     pub backend_step_micros: u128,
     pub scheduler_step_micros: u128,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EngineConfig {
     pub command_capacity: usize,
     pub pending_capacity: usize,
@@ -257,7 +263,7 @@ struct EngineRuntime<E> {
     active: BTreeMap<SequenceId, ActiveRequest>,
     free_slots: Vec<SequenceId>,
     max_batch_tokens: usize,
-    scheduler: BaselineScheduler,
+    scheduler: ConfiguredScheduler,
     next_admission_order: u64,
     started_at: Instant,
     observations: Arc<Mutex<VecDeque<EngineStepObservation>>>,
@@ -289,7 +295,7 @@ impl<E: ModelExecutor> EngineRuntime<E> {
             active: BTreeMap::new(),
             free_slots,
             max_batch_tokens: limits.max_batch_tokens,
-            scheduler: BaselineScheduler::new(scheduler_config),
+            scheduler: ConfiguredScheduler::new(scheduler_config),
             next_admission_order: 0,
             started_at: Instant::now(),
             observations,
@@ -407,6 +413,7 @@ impl<E: ModelExecutor> EngineRuntime<E> {
                 admission_order: request.admission_order,
                 phase: request.scheduler_phase(),
                 remaining_prefill_tokens: request.remaining_prefill_tokens(),
+                prefill_wait_micros: request.enqueued_at.elapsed().as_micros(),
             })
             .collect::<Vec<_>>();
         let scheduled = self.scheduler.plan(
@@ -436,6 +443,26 @@ impl<E: ModelExecutor> EngineRuntime<E> {
                 .flat_map(|work| work.tokens.iter().copied())
                 .collect(),
         };
+        let member_trace = planned
+            .iter()
+            .map(|work| {
+                let first = work.tokens.first().expect("planned work is nonempty");
+                let last = work.tokens.last().expect("planned work is nonempty");
+                format!(
+                    "seq:{} positions:{}..{} phase:{} tokens:{} logits:{}",
+                    work.sequence_id.0,
+                    first.position,
+                    last.position,
+                    match work.kind {
+                        WorkKind::Prefill => "prefill",
+                        WorkKind::Decode => "decode",
+                    },
+                    work.tokens.len(),
+                    work.tokens.iter().any(|token| token.request_logits)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
         if plan.tokens.is_empty() {
             self.fail_all("scheduler returned an empty plan for active requests".to_owned());
             return;
@@ -454,6 +481,59 @@ impl<E: ModelExecutor> EngineRuntime<E> {
             .filter(|work| work.kind == WorkKind::Decode)
             .map(|work| work.tokens.len())
             .sum::<usize>();
+        let chunk_budget = match self.scheduler.config() {
+            SchedulerConfig::FixedChunk {
+                prefill_chunk_tokens,
+            } => Some(prefill_chunk_tokens),
+            SchedulerConfig::Adaptive(_) => self
+                .scheduler
+                .adaptive_status()
+                .map(|status| status.current_chunk_tokens),
+            SchedulerConfig::Fcfs | SchedulerConfig::DecodePriority => None,
+        };
+        let adaptive_plan_reason = self
+            .scheduler
+            .adaptive_status()
+            .map(|status| status.plan_reason.as_str());
+        let outputs = match result {
+            Ok(outputs) => outputs,
+            Err(error) => {
+                self.fail_all(format!("execute shared batch: {error}"));
+                return;
+            }
+        };
+        let mut outputs = outputs
+            .into_iter()
+            .map(|output| (output.sequence_id, output))
+            .collect::<BTreeMap<_, _>>();
+        let mut finished = Vec::new();
+        let token_ready_at = Instant::now();
+        let mut observed_decode_gap_micros = None;
+        for work in planned {
+            let output = outputs.remove(&work.sequence_id);
+            let Some(request) = self.active.get_mut(&work.sequence_id) else {
+                continue;
+            };
+            if output.as_ref().is_some_and(|event| !event.is_eog) {
+                observed_decode_gap_micros = match (
+                    observed_decode_gap_micros,
+                    request.record_token_ready(token_ready_at),
+                ) {
+                    (current, None) => current,
+                    (None, Some(gap)) => Some(gap),
+                    (Some(current), Some(gap)) => Some(current.max(gap)),
+                };
+            }
+            match request.advance(&work.tokens, output) {
+                Ok(Some(reason)) => finished.push((work.sequence_id, EndState::Completed(reason))),
+                Ok(None) => {}
+                Err(error) => finished.push((work.sequence_id, error)),
+            }
+        }
+        if !outputs.is_empty() {
+            self.fail_all("backend returned output for an unrequested sequence".to_owned());
+            return;
+        }
         self.scheduler
             .observe(niniserve_scheduler::StepObservation {
                 scheduled_tokens: plan.tokens.len(),
@@ -461,13 +541,9 @@ impl<E: ModelExecutor> EngineRuntime<E> {
                 decode_tokens,
                 scheduling_micros: scheduling_us,
                 backend_micros: backend_us,
+                decode_gap_micros: observed_decode_gap_micros,
             });
-        let chunk_budget = match self.scheduler.config() {
-            SchedulerConfig::FixedChunk {
-                prefill_chunk_tokens,
-            } => Some(prefill_chunk_tokens),
-            SchedulerConfig::Fcfs | SchedulerConfig::DecodePriority => None,
-        };
+        let adaptive_status = self.scheduler.adaptive_status();
         if let Ok(mut observations) = self.observations.lock() {
             if observations.len() == RECENT_STEP_CAPACITY {
                 observations.pop_front();
@@ -481,67 +557,33 @@ impl<E: ModelExecutor> EngineRuntime<E> {
                 prefill_tokens,
                 decode_tokens,
                 chunk_budget,
+                next_chunk_budget: adaptive_status.map(|status| status.current_chunk_tokens),
+                observed_decode_gap_micros,
+                decode_gap_ewma_micros: adaptive_status
+                    .and_then(|status| status.decode_gap_ewma_micros)
+                    .map(|value| value.round() as u128),
+                adaptive_plan_reason,
+                adaptive_decision: adaptive_status.map(|status| status.decision.as_str()),
                 backend_step_micros: backend_us,
                 scheduler_step_micros: scheduling_us,
             });
         }
         eprintln!(
-            "scheduler_step step={} policy={} prefill_tokens={} decode_tokens={} members=[{}] scheduling_us={} backend_us={}",
+            "scheduler_step step={} policy={} prefill_tokens={} decode_tokens={} chunk_budget={:?} next_chunk_budget={:?} decode_gap_us={:?} plan_reason={:?} decision={:?} members=[{}] scheduling_us={} backend_us={}",
             self.step,
             self.scheduler.name(),
             prefill_tokens,
             decode_tokens,
-            planned
-                .iter()
-                .map(|work| {
-                    let first = work.tokens.first().expect("planned work is nonempty");
-                    let last = work.tokens.last().expect("planned work is nonempty");
-                    format!(
-                        "seq:{} positions:{}..{} phase:{} tokens:{} logits:{}",
-                        work.sequence_id.0,
-                        first.position,
-                        last.position,
-                        match work.kind {
-                            WorkKind::Prefill => "prefill",
-                            WorkKind::Decode => "decode",
-                        },
-                        work.tokens.len(),
-                        work.tokens.iter().any(|token| token.request_logits)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(", "),
+            chunk_budget,
+            adaptive_status.map(|status| status.current_chunk_tokens),
+            observed_decode_gap_micros,
+            adaptive_plan_reason,
+            adaptive_status.map(|status| status.decision.as_str()),
+            member_trace,
             scheduling_us,
             backend_us
         );
         self.step = self.step.saturating_add(1);
-        let outputs = match result {
-            Ok(outputs) => outputs,
-            Err(error) => {
-                self.fail_all(format!("execute shared batch: {error}"));
-                return;
-            }
-        };
-        let mut outputs = outputs
-            .into_iter()
-            .map(|output| (output.sequence_id, output))
-            .collect::<BTreeMap<_, _>>();
-        let mut finished = Vec::new();
-        for work in planned {
-            let output = outputs.remove(&work.sequence_id);
-            let Some(request) = self.active.get_mut(&work.sequence_id) else {
-                continue;
-            };
-            match request.advance(&work.tokens, output) {
-                Ok(Some(reason)) => finished.push((work.sequence_id, EndState::Completed(reason))),
-                Ok(None) => {}
-                Err(error) => finished.push((work.sequence_id, error)),
-            }
-        }
-        if !outputs.is_empty() {
-            self.fail_all("backend returned output for an unrequested sequence".to_owned());
-            return;
-        }
         for (sequence_id, state) in finished {
             self.finish_sequence(sequence_id, state);
         }
@@ -677,6 +719,7 @@ struct ActiveRequest {
     text: Utf8Accumulator,
     enqueued_at: Instant,
     admission_order: u64,
+    last_token_ready_at: Option<Instant>,
 }
 
 impl ActiveRequest {
@@ -743,6 +786,7 @@ impl ActiveRequest {
             text: Utf8Accumulator::default(),
             enqueued_at: pending.enqueued_at,
             admission_order: pending.admission_order,
+            last_token_ready_at: None,
         })
     }
 
@@ -784,6 +828,14 @@ impl ActiveRequest {
             RequestPhase::Prefill { prompt, next } => prompt.len() - next,
             RequestPhase::Decode { .. } => 0,
         }
+    }
+
+    fn record_token_ready(&mut self, now: Instant) -> Option<u128> {
+        let gap = self
+            .last_token_ready_at
+            .map(|previous| now.duration_since(previous).as_micros());
+        self.last_token_ready_at = Some(now);
+        gap
     }
 
     fn advance(
@@ -963,6 +1015,7 @@ mod tests {
         ModelExecutor, SamplingConfig,
     };
     use niniserve_protocol::{GenerationEvent, GenerationRequest, RequestId, SequenceId};
+    use niniserve_scheduler::AdaptiveConfig;
     use std::sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -1092,6 +1145,34 @@ mod tests {
         assert_eq!(recorded[2].len(), 1);
         assert!(!recorded[0][1].request_logits);
         assert!(recorded[2][0].request_logits);
+    }
+
+    #[tokio::test]
+    async fn adaptive_policy_uses_real_token_ready_gaps_and_exposes_decisions() {
+        let engine = EngineHandle::spawn(
+            MockExecutor::new(BackendLimits {
+                max_batch_tokens: 64,
+                max_active_sequences: 1,
+                max_sequence_tokens: 128,
+            }),
+            EngineConfig {
+                scheduler: SchedulerConfig::Adaptive(AdaptiveConfig::default()),
+                ..config()
+            },
+        );
+
+        let events = collect(&engine, 35).await;
+        assert!(matches!(
+            events.last(),
+            Some(GenerationEvent::Completed { .. })
+        ));
+        let observations = engine.recent_step_observations();
+        assert!(observations.iter().any(|step| {
+            step.policy == "adaptive"
+                && step.observed_decode_gap_micros.is_some()
+                && step.decode_gap_ewma_micros.is_some()
+                && step.adaptive_decision.is_some()
+        }));
     }
 
     #[tokio::test]

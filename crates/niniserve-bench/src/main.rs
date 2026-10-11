@@ -481,6 +481,7 @@ const fn scheduler_name(config: SchedulerConfig) -> &'static str {
         SchedulerConfig::Fcfs => "fcfs",
         SchedulerConfig::DecodePriority => "decode-priority",
         SchedulerConfig::FixedChunk { .. } => "fixed-chunk",
+        SchedulerConfig::Adaptive(_) => "adaptive",
     }
 }
 
@@ -489,6 +490,7 @@ const fn chunk_budget(config: SchedulerConfig) -> Option<usize> {
         SchedulerConfig::FixedChunk {
             prefill_chunk_tokens,
         } => Some(prefill_chunk_tokens),
+        SchedulerConfig::Adaptive(config) => Some(config.initial_chunk_tokens),
         SchedulerConfig::Fcfs | SchedulerConfig::DecodePriority => None,
     }
 }
@@ -545,12 +547,12 @@ fn write_steps(path: &Path, steps: &[EngineStepObservation]) -> Result<(), Box<d
     let mut file = File::create(path)?;
     writeln!(
         file,
-        "engine_step,timestamp_ms,policy,active_sequences,queued_requests,prefill_tokens,decode_tokens,chunk_budget,backend_step_ms,scheduler_step_us"
+        "engine_step,timestamp_ms,policy,active_sequences,queued_requests,prefill_tokens,decode_tokens,chunk_budget,next_chunk_budget,observed_decode_gap_us,decode_gap_ewma_us,adaptive_plan_reason,adaptive_decision,backend_step_ms,scheduler_step_us"
     )?;
     for step in steps {
         writeln!(
             file,
-            "{},{},{},{},{},{},{},{},{:.3},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{:.3},{}",
             step.engine_step,
             step.timestamp_ms,
             step.policy,
@@ -559,6 +561,11 @@ fn write_steps(path: &Path, steps: &[EngineStepObservation]) -> Result<(), Box<d
             step.prefill_tokens,
             step.decode_tokens,
             optional(step.chunk_budget.map(|value| value as u128)),
+            optional(step.next_chunk_budget.map(|value| value as u128)),
+            optional(step.observed_decode_gap_micros),
+            optional(step.decode_gap_ewma_micros),
+            step.adaptive_plan_reason.unwrap_or(""),
+            step.adaptive_decision.unwrap_or(""),
             step.backend_step_micros as f64 / 1_000.0,
             step.scheduler_step_micros
         )?;

@@ -19,7 +19,7 @@ use axum::{
     },
     routing::{get, post},
 };
-use niniserve_engine::{EngineHandle, EngineSubmitError, GenerationStream};
+use niniserve_engine::{EngineHandle, EngineStepObservation, EngineSubmitError, GenerationStream};
 use niniserve_protocol::{
     FinishReason, GenerationEvent, GenerationRequest, RequestId, RequestLimits,
 };
@@ -44,6 +44,7 @@ pub fn router(engine: EngineHandle, limits: RequestLimits) -> Router {
     };
     Router::new()
         .route("/healthz", get(health))
+        .route("/debug/engine", get(debug_engine))
         .route("/v1/completions", post(completions))
         .with_state(state)
 }
@@ -68,6 +69,65 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
             model_loaded: ready,
         }),
     )
+}
+
+#[derive(Debug, Serialize)]
+struct EngineDebugResponse {
+    ready: bool,
+    recent_steps: Vec<EngineDebugStep>,
+}
+
+#[derive(Debug, Serialize)]
+struct EngineDebugStep {
+    engine_step: u64,
+    timestamp_ms: u128,
+    policy: &'static str,
+    active_sequences: usize,
+    queued_requests: usize,
+    prefill_tokens: usize,
+    decode_tokens: usize,
+    chunk_budget: Option<usize>,
+    next_chunk_budget: Option<usize>,
+    observed_decode_gap_micros: Option<u128>,
+    decode_gap_ewma_micros: Option<u128>,
+    adaptive_plan_reason: Option<&'static str>,
+    adaptive_decision: Option<&'static str>,
+    backend_step_micros: u128,
+    scheduler_step_micros: u128,
+}
+
+impl From<EngineStepObservation> for EngineDebugStep {
+    fn from(step: EngineStepObservation) -> Self {
+        Self {
+            engine_step: step.engine_step,
+            timestamp_ms: step.timestamp_ms,
+            policy: step.policy,
+            active_sequences: step.active_sequences,
+            queued_requests: step.queued_requests,
+            prefill_tokens: step.prefill_tokens,
+            decode_tokens: step.decode_tokens,
+            chunk_budget: step.chunk_budget,
+            next_chunk_budget: step.next_chunk_budget,
+            observed_decode_gap_micros: step.observed_decode_gap_micros,
+            decode_gap_ewma_micros: step.decode_gap_ewma_micros,
+            adaptive_plan_reason: step.adaptive_plan_reason,
+            adaptive_decision: step.adaptive_decision,
+            backend_step_micros: step.backend_step_micros,
+            scheduler_step_micros: step.scheduler_step_micros,
+        }
+    }
+}
+
+async fn debug_engine(State(state): State<AppState>) -> Json<EngineDebugResponse> {
+    Json(EngineDebugResponse {
+        ready: state.engine.is_ready(),
+        recent_steps: state
+            .engine
+            .recent_step_observations()
+            .into_iter()
+            .map(EngineDebugStep::from)
+            .collect(),
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -342,6 +402,16 @@ mod tests {
         assert_eq!(
             to_bytes(health.into_body(), 1_024).await.unwrap(),
             r#"{"status":"ok","model_loaded":true}"#
+        );
+
+        let debug = app()
+            .oneshot(Request::get("/debug/engine").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(debug.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(debug.into_body(), 4_096).await.unwrap(),
+            r#"{"ready":true,"recent_steps":[]}"#
         );
 
         let response = app()
