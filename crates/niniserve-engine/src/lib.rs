@@ -21,7 +21,7 @@ use niniserve_scheduler::{
 };
 use tokio::sync::mpsc;
 
-pub use niniserve_scheduler::SchedulerConfig;
+pub use niniserve_scheduler::{AdaptiveConfig, SchedulerConfig};
 
 const RECENT_STEP_CAPACITY: usize = 4_096;
 
@@ -32,6 +32,7 @@ pub struct EngineStepObservation {
     pub policy: &'static str,
     pub active_sequences: usize,
     pub queued_requests: usize,
+    pub oldest_prefill_wait_micros: Option<u128>,
     pub prefill_tokens: usize,
     pub decode_tokens: usize,
     pub chunk_budget: Option<usize>,
@@ -424,6 +425,11 @@ impl<E: ModelExecutor> EngineRuntime<E> {
                 max_batch_tokens: self.max_batch_tokens,
             },
         );
+        let oldest_prefill_wait_micros = snapshot
+            .iter()
+            .filter(|sequence| sequence.phase == SequencePhase::Prefill)
+            .map(|sequence| sequence.prefill_wait_micros)
+            .max();
         let planned = scheduled
             .work
             .into_iter()
@@ -554,6 +560,7 @@ impl<E: ModelExecutor> EngineRuntime<E> {
                 policy: self.scheduler.name(),
                 active_sequences: self.active.len(),
                 queued_requests: self.pending.len(),
+                oldest_prefill_wait_micros,
                 prefill_tokens,
                 decode_tokens,
                 chunk_budget,
