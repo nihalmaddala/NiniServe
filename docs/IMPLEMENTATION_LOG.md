@@ -3,6 +3,35 @@
 This log records verified work, command outcomes, blockers, and the next scoped
 task. It is not a roadmap completion claim.
 
+## 2026-10-11 — Issue #14 Phase 4 adaptive-prefill plan
+
+### Phase and scope
+
+Phase 4 adaptive prefill control and real-model evaluation on
+`feat/phase4-adaptive-controller`. This milestone tests the controller research
+question; it does not begin later scheduling, distributed-serving, MTP, or UI
+work, and it will not claim an improvement unless held-out measurements support
+one.
+
+### Plan
+
+1. Add a validated, bounded EWMA/hysteresis controller behind the existing
+   scheduler seam, with explicit startup/no-decoder behavior and a maximum-wait
+   prefill fairness rule.
+2. Develop it test-first against synthetic token-gap regimes, covering bounds,
+   stability, recovery, repeated overload, and progress under decode load.
+3. Measure server-side per-sequence decode token gaps in the exclusive-owner
+   engine and expose controller configuration, decisions, and current state in
+   structured observations and the debug endpoint.
+4. Extend the benchmark with W5, repeated trials, and a dependency-free
+   trajectory plot tying selected chunks to observed decode gaps.
+5. Freeze one documented adaptive configuration, then compare it on the local
+   Qwen GGUF against fixed chunks 64, 128, 256, and 512 across W2, W3, and W5.
+6. Record exact commands, raw results, limitations, and negative findings;
+   finish formatting, Clippy, tests, PR review, CI, and merge only when clean.
+
+Tracking issue: [#14](https://github.com/nihalmaddala/NiniServe/issues/14).
+
 ## 2026-10-10 — Issue #12 Phase 3 baseline-scheduler plan
 
 ### Phase and scope
