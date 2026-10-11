@@ -406,10 +406,14 @@ async fn run(config: RunConfig) -> Result<(), Box<dyn Error>> {
         .collect();
     let serial = matches!(config.workload, Workload::W0);
     execute_requests(&engine, warmup, config.scheduler, serial).await?;
+    engine.reset_scheduler()?;
     let _ = engine.take_step_observations();
     let measured_started = Instant::now();
     let mut results = Vec::with_capacity(measured_requests);
     for repeat in 0..config.repeats {
+        if repeat > 0 {
+            engine.reset_scheduler()?;
+        }
         let offset_ms = measured_started.elapsed().as_millis();
         let repeated = requests
             .iter()

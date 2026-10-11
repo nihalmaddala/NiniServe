@@ -161,6 +161,14 @@ impl EngineHandle {
         self.try_send(EngineCommand::Cancel { request_id })
     }
 
+    pub fn reset_scheduler(&self) -> Result<(), EngineSubmitError> {
+        let (completed, wait_for_completion) = std::sync::mpsc::sync_channel(0);
+        self.try_send(EngineCommand::ResetScheduler { completed })?;
+        wait_for_completion
+            .recv()
+            .map_err(|_| EngineSubmitError::Stopped)
+    }
+
     #[must_use]
     pub fn recent_step_observations(&self) -> Vec<EngineStepObservation> {
         self.inner.observations.lock().map_or_else(
@@ -252,6 +260,9 @@ enum EngineCommand {
     },
     Cancel {
         request_id: RequestId,
+    },
+    ResetScheduler {
+        completed: std::sync::mpsc::SyncSender<()>,
     },
 }
 
@@ -356,6 +367,10 @@ impl<E: ModelExecutor> EngineRuntime<E> {
                 }
             }
             EngineCommand::Cancel { request_id } => self.cancel_request(request_id, true),
+            EngineCommand::ResetScheduler { completed } => {
+                self.scheduler.reset();
+                let _ = completed.send(());
+            }
         }
     }
 

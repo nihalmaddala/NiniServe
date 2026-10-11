@@ -416,6 +416,10 @@ impl ConfiguredScheduler {
             Self::Adaptive(scheduler) => SchedulerConfig::Adaptive(scheduler.config()),
         }
     }
+
+    pub fn reset(&mut self) {
+        *self = Self::new(self.config());
+    }
 }
 
 impl Scheduler for ConfiguredScheduler {
@@ -550,9 +554,9 @@ fn plan_with_prefill_reservation(
 #[cfg(test)]
 mod tests {
     use super::{
-        AdaptiveConfig, AdaptiveDecision, AdaptiveScheduler, BaselineScheduler, EngineView,
-        SchedulePlan, ScheduledWork, Scheduler, SchedulerConfig, SequencePhase, SequenceSnapshot,
-        StepBudget, StepObservation, WorkKind,
+        AdaptiveConfig, AdaptiveDecision, AdaptiveScheduler, BaselineScheduler,
+        ConfiguredScheduler, EngineView, SchedulePlan, ScheduledWork, Scheduler, SchedulerConfig,
+        SequencePhase, SequenceSnapshot, StepBudget, StepObservation, WorkKind,
     };
     use niniserve_protocol::SequenceId;
 
@@ -619,6 +623,23 @@ mod tests {
             previous = current;
         }
         assert_eq!(previous, 32);
+    }
+
+    #[test]
+    fn configured_scheduler_reset_restores_adaptive_startup_state() {
+        let mut scheduler =
+            ConfiguredScheduler::new(SchedulerConfig::Adaptive(AdaptiveConfig::default()));
+        scheduler.observe(observation(Some(200_000)));
+        assert_eq!(
+            scheduler.adaptive_status().unwrap().current_chunk_tokens,
+            64
+        );
+
+        scheduler.reset();
+
+        let status = scheduler.adaptive_status().unwrap();
+        assert_eq!(status.current_chunk_tokens, 128);
+        assert_eq!(status.decision, AdaptiveDecision::Startup);
     }
 
     #[test]
