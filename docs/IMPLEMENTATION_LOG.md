@@ -3,6 +3,139 @@
 This log records verified work, command outcomes, blockers, and the next scoped
 task. It is not a roadmap completion claim.
 
+## 2026-10-11 — Issue #14 Phase 4 adaptive-prefill plan
+
+### Phase and scope
+
+Phase 4 adaptive prefill control and real-model evaluation on
+`feat/phase4-adaptive-controller`. This milestone tests the controller research
+question; it does not begin later scheduling, distributed-serving, MTP, or UI
+work, and it will not claim an improvement unless held-out measurements support
+one.
+
+### Plan
+
+1. Add a validated, bounded EWMA/hysteresis controller behind the existing
+   scheduler seam, with explicit startup/no-decoder behavior and a maximum-wait
+   prefill fairness rule.
+2. Develop it test-first against synthetic token-gap regimes, covering bounds,
+   stability, recovery, repeated overload, and progress under decode load.
+3. Measure server-side per-sequence decode token gaps in the exclusive-owner
+   engine and expose controller configuration, decisions, and current state in
+   structured observations and the debug endpoint.
+4. Extend the benchmark with W5, repeated trials, and a dependency-free
+   trajectory plot tying selected chunks to observed decode gaps.
+5. Freeze one documented adaptive configuration, then compare it on the local
+   Qwen GGUF against fixed chunks 64, 128, 256, and 512 across W2, W3, and W5.
+6. Record exact commands, raw results, limitations, and negative findings;
+   finish formatting, Clippy, tests, PR review, CI, and merge only when clean.
+
+Tracking issue: [#14](https://github.com/nihalmaddala/NiniServe/issues/14).
+
+### Result
+
+PASS for the Phase 4 research gate, with a negative performance result. The
+bounded adaptive controller executed on real inference, changed actual prefill
+budgets, emitted reproducible decision traces, and completed every request.
+The frozen configuration did **not** outperform the fixed controls, so no
+adaptive speedup or superiority claim is made.
+
+### Implemented
+
+- Added `AdaptiveScheduler` with a constant-size decode-gap EWMA, low/high
+  hysteresis, multiplicative decrease, additive increase, validated 32–512
+  token bounds, an explicit 128-token startup value, and full safe prefill
+  capacity when no decoder is active.
+- Added a 500 ms admitted-prefill max-wait override. It reserves bounded
+  prefill work under saturated decode load and has deterministic unit coverage.
+- Measured the maximum server-side per-sequence sampled-token-ready gap after
+  each backend step. The feedback signal is independent of HTTP/network timing;
+  client-observed ITL remains a separate reported metric.
+- Extended bounded engine observations and `GET /debug/engine` with selected
+  and next chunk budgets, raw gap, EWMA, oldest active-prefill wait, plan
+  rationale, and feedback decision.
+- Exposed every controller parameter through the server and benchmark CLIs.
+- Added W5, `--repeats`, scheduler-state reset between measured trials, queue
+  wait summaries, richer scheduler CSV data, and a dependency-free `plot`
+  command that writes `adaptive_trajectory.svg`.
+
+The public scheduler seam remains the test seam: synthetic `StepObservation`
+values drive controller state, and subsequent `plan` calls reveal the selected
+budget and fairness behavior. Backend-specific and unsafe code remains confined
+to `niniserve-backend`.
+
+### Frozen real-model experiment
+
+Release runs used commit `8df97ae0a6272bbf8dfc9c80691fe8205d3d6c91`,
+`llama-cpp-2 = 0.1.159`, the ignored Qwen2.5-0.5B-Instruct Q4_K_M model
+(SHA-256 `74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db`),
+and Apple M2 Metal with 25/25 layers offloaded. Context limits remained
+`n_ctx=8192`, `n_ctx_seq=2048`, `n_batch=512`, `n_ubatch=128`, and
+`n_seq_max=4`; model loads took 378–796 ms.
+
+The adaptive configuration was frozen before the final matrix: target decode
+gap 75 ms, chunk min/max/initial 32/512/128, increase 32, decrease factor 0.5,
+EWMA alpha 0.2, low/high thresholds 0.85/1.10, and admitted-prefill max wait
+500 ms. Each cell used one workload-shaped warmup followed by three measured
+trials; scheduler feedback state was reset before every measured trial. All 285
+measured requests completed.
+
+| Policy | Workload | Finished | TTFT p50/p95 ms | ITL p50/p95 ms | Queue p95/max ms | Window ms | Output tok/s |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Fixed 64 | W2 | 9/9 | 224 / 1446 | 27 / 89 | 43 / 43 | 10899 | 70.47 |
+| Fixed 128 | W2 | 9/9 | 135 / 1117 | 27 / 124 | 64 / 64 | 10961 | 70.07 |
+| Fixed 256 | W2 | 9/9 | 102 / 834 | 25 / 31 | 27 / 27 | 9455 | 81.23 |
+| Fixed 512 | W2 | 9/9 | 106 / 896 | 25 / 33 | 37 / 37 | 9593 | 80.06 |
+| Adaptive | W2 | 9/9 | 98 / 1441 | 27 / 57 | 25 / 25 | 10310 | 74.49 |
+| Fixed 64 | W3 | 30/30 | 1711 / 5215 | 30 / 102 | 3672 / 3750 | 21105 | 77.33 |
+| Fixed 128 | W3 | 30/30 | 1564 / 4554 | 28 / 136 | 3453 / 3495 | 19258 | 84.74 |
+| Fixed 256 | W3 | 30/30 | 1578 / 4453 | 28 / 50 | 3571 / 3668 | 18849 | 86.58 |
+| Fixed 512 | W3 | 30/30 | 1691 / 4291 | 28 / 45 | 3403 / 3551 | 18397 | 88.71 |
+| Adaptive | W3 | 30/30 | 1894 / 5296 | 28 / 72 | 3416 / 3436 | 20716 | 78.78 |
+| Fixed 64 | W5 | 18/18 | 1452 / 5152 | 31 / 104 | 3641 / 3641 | 23958 | 72.13 |
+| Fixed 128 | W5 | 18/18 | 982 / 4183 | 29 / 140 | 3011 / 3011 | 21224 | 81.42 |
+| Fixed 256 | W5 | 18/18 | 997 / 4119 | 29 / 48 | 3214 / 3214 | 20846 | 82.89 |
+| Fixed 512 | W5 | 18/18 | 884 / 3809 | 29 / 46 | 3002 / 3002 | 20852 | 82.87 |
+| Adaptive | W5 | 18/18 | 1072 / 5450 | 30 / 82 | 3202 / 3202 | 24232 | 71.31 |
+
+Adaptive selected the full 32–512 range. Max-wait planning fired 47 times in
+W2, 105 times in W3, and 179 times in W5. The controller often increased
+toward large chunks because most observed gaps were below 63.75 ms, then
+reacted only after a costly gap crossed the 82.5 ms high threshold. That lag,
+plus frequent fairness overrides, is consistent with the weaker W3/W5 tail
+TTFT and throughput. This is an observed mechanism, not a causal proof.
+
+The 500 ms fairness threshold applies only to prefills already occupying one of
+four backend sequence slots. Maximum observed active-prefill ages were 1.349 s,
+5.521 s, and 5.340 s for W2/W3/W5 because an override is checked only at step
+boundaries and long backend calls are non-preemptive. Requests waiting outside
+the active set can also exceed 500 ms; Phase 4 does not solve admission
+fairness. Aggregate three-trial samples on one machine are not confidence
+intervals and do not generalize to other models or hardware.
+
+### Exact experiment commands
+
+```text
+cargo build --release -p niniserve-bench
+
+For workload in W2 W3 W5 and chunk in 64 128 256 512:
+target/release/niniserve-bench run --model models/qwen2.5-0.5b-instruct-q4_k_m.gguf --scheduler fixed-chunk --prefill-chunk-tokens CHUNK --workload WORKLOAD --repeats 3 --output results/phase4/fixedCHUNK-workload
+
+For workload in W2 W3 W5:
+target/release/niniserve-bench run --model models/qwen2.5-0.5b-instruct-q4_k_m.gguf --scheduler adaptive --workload WORKLOAD --repeats 3 --output results/phase4/adaptive-workload
+target/release/niniserve-bench plot results/phase4/adaptive-workload
+```
+
+Raw JSON, CSV, logs, and SVGs remain intentionally ignored under
+`results/phase4/`.
+
+### Next task
+
+Stop after Phase 4. The smallest Phase 5 slice is robustness and publishability:
+add graceful in-flight drain semantics, explicit overload/load-shedding tests,
+and a reproducible benchmark manifest/report command without changing the
+scheduler policy or claiming performance gains.
+
 ## 2026-10-10 — Issue #12 Phase 3 baseline-scheduler plan
 
 ### Phase and scope

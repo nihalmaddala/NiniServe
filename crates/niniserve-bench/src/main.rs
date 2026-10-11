@@ -14,7 +14,9 @@ use niniserve_backend::{
     ModelExecutor,
     llamacpp::{LlamaCppConfig, LlamaCppExecutor},
 };
-use niniserve_engine::{EngineConfig, EngineHandle, EngineStepObservation, SchedulerConfig};
+use niniserve_engine::{
+    AdaptiveConfig, EngineConfig, EngineHandle, EngineStepObservation, SchedulerConfig,
+};
 use niniserve_protocol::{FinishReason, GenerationEvent, GenerationRequest, RequestId};
 use serde::Serialize;
 
@@ -24,6 +26,7 @@ const BACKEND_VERSION: &str = "llama-cpp-2 0.1.159";
 enum Cli {
     Run(RunConfig),
     Summary(PathBuf),
+    Plot(PathBuf),
 }
 
 #[derive(Debug)]
@@ -32,6 +35,7 @@ struct RunConfig {
     scheduler: SchedulerConfig,
     workload: Workload,
     output: Option<PathBuf>,
+    repeats: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -40,6 +44,7 @@ enum Workload {
     W1,
     W2,
     W3,
+    W5,
 }
 
 impl Workload {
@@ -49,8 +54,9 @@ impl Workload {
             "w1" => Ok(Self::W1),
             "w2" => Ok(Self::W2),
             "w3" => Ok(Self::W3),
+            "w5" => Ok(Self::W5),
             _ => Err(format!(
-                "unknown workload {value:?}; expected W0, W1, W2, or W3"
+                "unknown workload {value:?}; expected W0, W1, W2, W3, or W5"
             )),
         }
     }
@@ -61,6 +67,7 @@ impl Workload {
             Self::W1 => "W1_concurrent_short",
             Self::W2 => "W2_long_prompt_interference",
             Self::W3 => "W3_deterministic_mixed",
+            Self::W5 => "W5_load_transition",
         }
     }
 }
@@ -87,6 +94,7 @@ struct Metadata<'a> {
     workload: &'static str,
     warmup_requests: usize,
     measured_requests: usize,
+    repeats: usize,
     model_load_ms: u128,
     started_at_unix_seconds: u64,
 }
@@ -94,6 +102,16 @@ struct Metadata<'a> {
 #[derive(Debug, Serialize)]
 struct SchedulerMetadata {
     prefill_chunk_tokens: Option<usize>,
+    target_decode_gap_micros: Option<u128>,
+    min_chunk_tokens: Option<usize>,
+    max_chunk_tokens: Option<usize>,
+    initial_chunk_tokens: Option<usize>,
+    increase_step_tokens: Option<usize>,
+    decrease_factor: Option<f64>,
+    ewma_alpha: Option<f64>,
+    low_threshold_factor: Option<f64>,
+    high_threshold_factor: Option<f64>,
+    max_prefill_wait_micros: Option<u128>,
 }
 
 #[derive(Debug)]
@@ -126,6 +144,8 @@ struct Summary {
     failed_count: usize,
     total_output_tokens: usize,
     elapsed_window_ms: u128,
+    queue_wait_p95_ms: Option<u128>,
+    queue_wait_max_ms: Option<u128>,
     ttft_p50_ms: Option<u128>,
     ttft_p95_ms: Option<u128>,
     itl_sample_count: usize,
@@ -137,11 +157,20 @@ struct Summary {
     requests_per_second: Option<f64>,
 }
 
+#[derive(Debug)]
+struct SummarySamples {
+    queue_wait: Vec<u128>,
+    ttft: Vec<u128>,
+    itl: Vec<u128>,
+    e2e: Vec<u128>,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     match parse_cli(env::args().skip(1))? {
         Cli::Run(config) => run(config).await,
         Cli::Summary(input) => summarize(&input),
+        Cli::Plot(input) => plot(&input),
     }
 }
 
@@ -153,6 +182,9 @@ fn parse_cli(mut arguments: impl Iterator<Item = String>) -> Result<Cli, String>
             let mut workload = None;
             let mut output = None;
             let mut chunk = None;
+            let mut repeats = 1;
+            let mut adaptive = AdaptiveConfig::default();
+            let mut adaptive_changed = false;
             while let Some(argument) = arguments.next() {
                 match argument.as_str() {
                     "--model" => model = Some(PathBuf::from(next(&mut arguments, "--model")?)),
@@ -167,6 +199,86 @@ fn parse_cli(mut arguments: impl Iterator<Item = String>) -> Result<Cli, String>
                             "--prefill-chunk-tokens",
                         )?);
                     }
+                    "--repeats" => {
+                        repeats = parse_positive(
+                            &next(&mut arguments, "--repeats")?,
+                            "--repeats",
+                        )?;
+                    }
+                    "--target-itl-ms" => {
+                        adaptive.target_decode_gap_micros = parse_positive_u128(
+                            &next(&mut arguments, "--target-itl-ms")?,
+                            "--target-itl-ms",
+                        )?
+                        .checked_mul(1_000)
+                        .ok_or("--target-itl-ms is too large")?;
+                        adaptive_changed = true;
+                    }
+                    "--adaptive-min-chunk-tokens" => {
+                        adaptive.min_chunk_tokens = parse_positive(
+                            &next(&mut arguments, "--adaptive-min-chunk-tokens")?,
+                            "--adaptive-min-chunk-tokens",
+                        )?;
+                        adaptive_changed = true;
+                    }
+                    "--adaptive-max-chunk-tokens" => {
+                        adaptive.max_chunk_tokens = parse_positive(
+                            &next(&mut arguments, "--adaptive-max-chunk-tokens")?,
+                            "--adaptive-max-chunk-tokens",
+                        )?;
+                        adaptive_changed = true;
+                    }
+                    "--adaptive-initial-chunk-tokens" => {
+                        adaptive.initial_chunk_tokens = parse_positive(
+                            &next(&mut arguments, "--adaptive-initial-chunk-tokens")?,
+                            "--adaptive-initial-chunk-tokens",
+                        )?;
+                        adaptive_changed = true;
+                    }
+                    "--adaptive-increase-step-tokens" => {
+                        adaptive.increase_step_tokens = parse_positive(
+                            &next(&mut arguments, "--adaptive-increase-step-tokens")?,
+                            "--adaptive-increase-step-tokens",
+                        )?;
+                        adaptive_changed = true;
+                    }
+                    "--adaptive-decrease-factor" => {
+                        adaptive.decrease_factor = parse_number(
+                            &next(&mut arguments, "--adaptive-decrease-factor")?,
+                            "--adaptive-decrease-factor",
+                        )?;
+                        adaptive_changed = true;
+                    }
+                    "--adaptive-ewma-alpha" => {
+                        adaptive.ewma_alpha = parse_number(
+                            &next(&mut arguments, "--adaptive-ewma-alpha")?,
+                            "--adaptive-ewma-alpha",
+                        )?;
+                        adaptive_changed = true;
+                    }
+                    "--adaptive-low-threshold-factor" => {
+                        adaptive.low_threshold_factor = parse_number(
+                            &next(&mut arguments, "--adaptive-low-threshold-factor")?,
+                            "--adaptive-low-threshold-factor",
+                        )?;
+                        adaptive_changed = true;
+                    }
+                    "--adaptive-high-threshold-factor" => {
+                        adaptive.high_threshold_factor = parse_number(
+                            &next(&mut arguments, "--adaptive-high-threshold-factor")?,
+                            "--adaptive-high-threshold-factor",
+                        )?;
+                        adaptive_changed = true;
+                    }
+                    "--adaptive-max-prefill-wait-ms" => {
+                        adaptive.max_prefill_wait_micros = parse_positive_u128(
+                            &next(&mut arguments, "--adaptive-max-prefill-wait-ms")?,
+                            "--adaptive-max-prefill-wait-ms",
+                        )?
+                        .checked_mul(1_000)
+                        .ok_or("--adaptive-max-prefill-wait-ms is too large")?;
+                        adaptive_changed = true;
+                    }
                     "--workload" => {
                         workload = Some(Workload::parse(&next(&mut arguments, "--workload")?)?);
                     }
@@ -174,32 +286,40 @@ fn parse_cli(mut arguments: impl Iterator<Item = String>) -> Result<Cli, String>
                     _ => return Err(format!("unknown argument {argument:?}")),
                 }
             }
-            scheduler = match (scheduler, chunk) {
-                (SchedulerConfig::FixedChunk { prefill_chunk_tokens }, None) => {
+            scheduler = match (scheduler, chunk, adaptive_changed) {
+                (SchedulerConfig::FixedChunk { prefill_chunk_tokens }, None, false) => {
                     SchedulerConfig::FixedChunk { prefill_chunk_tokens }
                 }
-                (SchedulerConfig::FixedChunk { .. }, Some(prefill_chunk_tokens)) => {
+                (SchedulerConfig::FixedChunk { .. }, Some(prefill_chunk_tokens), false) => {
                     SchedulerConfig::FixedChunk { prefill_chunk_tokens }
                 }
-                (scheduler, None) => scheduler,
-                (_, Some(_)) => {
+                (SchedulerConfig::Adaptive(_), None, _) => SchedulerConfig::Adaptive(
+                    adaptive.validate().map_err(|error| error.to_string())?,
+                ),
+                (scheduler, None, false) => scheduler,
+                (_, Some(_), _) => {
                     return Err(
                         "--prefill-chunk-tokens requires --scheduler fixed-chunk".to_owned(),
                     );
+                }
+                (_, None, true) => {
+                    return Err("adaptive tuning flags require --scheduler adaptive".to_owned());
                 }
             };
             Ok(Cli::Run(RunConfig {
                 model: model.ok_or("run requires --model MODEL.gguf")?,
                 scheduler,
-                workload: workload.ok_or("run requires --workload W0|W1|W2|W3")?,
+                workload: workload.ok_or("run requires --workload W0|W1|W2|W3|W5")?,
                 output,
+                repeats,
             }))
         }
         Some("summary") => Ok(Cli::Summary(PathBuf::from(next(
             &mut arguments,
             "summary",
         )?))),
-        _ => Err("usage: niniserve-bench run --model MODEL.gguf --scheduler POLICY --workload W0|W1|W2|W3 [--output DIR] | summary RUN_DIR".to_owned()),
+        Some("plot") => Ok(Cli::Plot(PathBuf::from(next(&mut arguments, "plot")?))),
+        _ => Err("usage: niniserve-bench run --model MODEL.gguf --scheduler POLICY --workload W0|W1|W2|W3|W5 [--repeats N] [--output DIR] | summary RUN_DIR | plot RUN_DIR".to_owned()),
     }
 }
 
@@ -217,6 +337,22 @@ fn parse_positive(value: &str, flag: &str) -> Result<usize, String> {
         return Err(format!("{flag} must be positive"));
     }
     Ok(parsed)
+}
+
+fn parse_positive_u128(value: &str, flag: &str) -> Result<u128, String> {
+    let parsed = value
+        .parse::<u128>()
+        .map_err(|error| format!("invalid {flag}: {error}"))?;
+    if parsed == 0 {
+        return Err(format!("{flag} must be positive"));
+    }
+    Ok(parsed)
+}
+
+fn parse_number(value: &str, flag: &str) -> Result<f64, String> {
+    value
+        .parse::<f64>()
+        .map_err(|error| format!("invalid {flag}: {error}"))
 }
 
 async fn run(config: RunConfig) -> Result<(), Box<dyn Error>> {
@@ -249,7 +385,7 @@ async fn run(config: RunConfig) -> Result<(), Box<dyn Error>> {
     let executor = LlamaCppExecutor::load(&backend_config)?;
     let model_load_ms = load_started.elapsed().as_millis();
     let requests = workload_requests(config.workload, &executor)?;
-    let measured_requests = requests.len();
+    let measured_requests = requests.len() * config.repeats;
     let engine = EngineHandle::spawn(
         executor,
         EngineConfig {
@@ -270,8 +406,32 @@ async fn run(config: RunConfig) -> Result<(), Box<dyn Error>> {
         .collect();
     let serial = matches!(config.workload, Workload::W0);
     execute_requests(&engine, warmup, config.scheduler, serial).await?;
+    engine.reset_scheduler()?;
     let _ = engine.take_step_observations();
-    let results = execute_requests(&engine, requests, config.scheduler, serial).await?;
+    let measured_started = Instant::now();
+    let mut results = Vec::with_capacity(measured_requests);
+    for repeat in 0..config.repeats {
+        if repeat > 0 {
+            engine.reset_scheduler()?;
+        }
+        let offset_ms = measured_started.elapsed().as_millis();
+        let repeated = requests
+            .iter()
+            .cloned()
+            .map(|mut request| {
+                request.id = RequestId(request.id.0 + repeat as u64 * 1_000);
+                request
+            })
+            .collect();
+        let mut repetition = execute_requests(&engine, repeated, config.scheduler, serial).await?;
+        for result in &mut repetition {
+            result.arrival_ms += offset_ms;
+            for gap in &mut result.token_gaps {
+                gap.ready_at_ms += offset_ms;
+            }
+        }
+        results.extend(repetition);
+    }
     let steps = engine.take_step_observations();
     let metadata = Metadata {
         run_id: &run_id,
@@ -284,12 +444,11 @@ async fn run(config: RunConfig) -> Result<(), Box<dyn Error>> {
         os: format!("{}-{}", env::consts::OS, env::consts::ARCH),
         hardware: command_output("sysctl", &["-n", "machdep.cpu.brand_string"]),
         scheduler: scheduler_name(config.scheduler),
-        scheduler_config: SchedulerMetadata {
-            prefill_chunk_tokens: chunk_budget(config.scheduler),
-        },
+        scheduler_config: scheduler_metadata(config.scheduler),
         workload: config.workload.name(),
-        warmup_requests: measured_requests,
+        warmup_requests: requests.len(),
         measured_requests,
+        repeats: config.repeats,
         model_load_ms,
         started_at_unix_seconds,
     };
@@ -449,6 +608,14 @@ fn workload_requests(
                 )
             })
             .collect(),
+        Workload::W5 => vec![
+            (32, 160, 0),
+            (32, 160, 0),
+            (850, 64, 400),
+            (850, 64, 700),
+            (850, 64, 1_000),
+            (32, 64, 4_000),
+        ],
     };
     shapes
         .into_iter()
@@ -481,6 +648,7 @@ const fn scheduler_name(config: SchedulerConfig) -> &'static str {
         SchedulerConfig::Fcfs => "fcfs",
         SchedulerConfig::DecodePriority => "decode-priority",
         SchedulerConfig::FixedChunk { .. } => "fixed-chunk",
+        SchedulerConfig::Adaptive(_) => "adaptive",
     }
 }
 
@@ -489,7 +657,39 @@ const fn chunk_budget(config: SchedulerConfig) -> Option<usize> {
         SchedulerConfig::FixedChunk {
             prefill_chunk_tokens,
         } => Some(prefill_chunk_tokens),
+        SchedulerConfig::Adaptive(config) => Some(config.initial_chunk_tokens),
         SchedulerConfig::Fcfs | SchedulerConfig::DecodePriority => None,
+    }
+}
+
+const fn scheduler_metadata(config: SchedulerConfig) -> SchedulerMetadata {
+    match config {
+        SchedulerConfig::Adaptive(adaptive) => SchedulerMetadata {
+            prefill_chunk_tokens: None,
+            target_decode_gap_micros: Some(adaptive.target_decode_gap_micros),
+            min_chunk_tokens: Some(adaptive.min_chunk_tokens),
+            max_chunk_tokens: Some(adaptive.max_chunk_tokens),
+            initial_chunk_tokens: Some(adaptive.initial_chunk_tokens),
+            increase_step_tokens: Some(adaptive.increase_step_tokens),
+            decrease_factor: Some(adaptive.decrease_factor),
+            ewma_alpha: Some(adaptive.ewma_alpha),
+            low_threshold_factor: Some(adaptive.low_threshold_factor),
+            high_threshold_factor: Some(adaptive.high_threshold_factor),
+            max_prefill_wait_micros: Some(adaptive.max_prefill_wait_micros),
+        },
+        baseline => SchedulerMetadata {
+            prefill_chunk_tokens: chunk_budget(baseline),
+            target_decode_gap_micros: None,
+            min_chunk_tokens: None,
+            max_chunk_tokens: None,
+            initial_chunk_tokens: None,
+            increase_step_tokens: None,
+            decrease_factor: None,
+            ewma_alpha: None,
+            low_threshold_factor: None,
+            high_threshold_factor: None,
+            max_prefill_wait_micros: None,
+        },
     }
 }
 
@@ -545,20 +745,26 @@ fn write_steps(path: &Path, steps: &[EngineStepObservation]) -> Result<(), Box<d
     let mut file = File::create(path)?;
     writeln!(
         file,
-        "engine_step,timestamp_ms,policy,active_sequences,queued_requests,prefill_tokens,decode_tokens,chunk_budget,backend_step_ms,scheduler_step_us"
+        "engine_step,timestamp_ms,policy,active_sequences,queued_requests,oldest_prefill_wait_us,prefill_tokens,decode_tokens,chunk_budget,next_chunk_budget,observed_decode_gap_us,decode_gap_ewma_us,adaptive_plan_reason,adaptive_decision,backend_step_ms,scheduler_step_us"
     )?;
     for step in steps {
         writeln!(
             file,
-            "{},{},{},{},{},{},{},{},{:.3},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.3},{}",
             step.engine_step,
             step.timestamp_ms,
             step.policy,
             step.active_sequences,
             step.queued_requests,
+            optional(step.oldest_prefill_wait_micros),
             step.prefill_tokens,
             step.decode_tokens,
             optional(step.chunk_budget.map(|value| value as u128)),
+            optional(step.next_chunk_budget.map(|value| value as u128)),
+            optional(step.observed_decode_gap_micros),
+            optional(step.decode_gap_ewma_micros),
+            step.adaptive_plan_reason.unwrap_or(""),
+            step.adaptive_decision.unwrap_or(""),
             step.backend_step_micros as f64 / 1_000.0,
             step.scheduler_step_micros
         )?;
@@ -579,6 +785,10 @@ fn summary_from_results(results: &[RequestResult]) -> Summary {
         .iter()
         .map(|result| result.e2e_ms)
         .collect::<Vec<_>>();
+    let queue_wait = results
+        .iter()
+        .filter_map(|result| result.queue_wait_ms)
+        .collect::<Vec<_>>();
     let itl = results
         .iter()
         .flat_map(|result| &result.token_gaps)
@@ -593,9 +803,12 @@ fn summary_from_results(results: &[RequestResult]) -> Summary {
             .map(|result| result.arrival_ms + result.e2e_ms)
             .max()
             .unwrap_or(0),
-        ttft,
-        itl,
-        e2e,
+        SummarySamples {
+            queue_wait,
+            ttft,
+            itl,
+            e2e,
+        },
     )
 }
 
@@ -613,9 +826,7 @@ fn build_summary(
     finished_count: usize,
     total_output_tokens: usize,
     elapsed_window_ms: u128,
-    ttft: Vec<u128>,
-    itl: Vec<u128>,
-    e2e: Vec<u128>,
+    samples: SummarySamples,
 ) -> Summary {
     let elapsed_seconds =
         Duration::from_millis(u64::try_from(elapsed_window_ms).unwrap_or(u64::MAX)).as_secs_f64();
@@ -625,13 +836,15 @@ fn build_summary(
         failed_count: request_count.saturating_sub(finished_count),
         total_output_tokens,
         elapsed_window_ms,
-        ttft_p50_ms: percentile(ttft.clone(), 50),
-        ttft_p95_ms: percentile(ttft, 95),
-        itl_sample_count: itl.len(),
-        itl_p50_ms: percentile(itl.clone(), 50),
-        itl_p95_ms: percentile(itl, 95),
-        e2e_p50_ms: percentile(e2e.clone(), 50),
-        e2e_p95_ms: percentile(e2e, 95),
+        queue_wait_p95_ms: percentile(samples.queue_wait.clone(), 95),
+        queue_wait_max_ms: samples.queue_wait.into_iter().max(),
+        ttft_p50_ms: percentile(samples.ttft.clone(), 50),
+        ttft_p95_ms: percentile(samples.ttft, 95),
+        itl_sample_count: samples.itl.len(),
+        itl_p50_ms: percentile(samples.itl.clone(), 50),
+        itl_p95_ms: percentile(samples.itl, 95),
+        e2e_p50_ms: percentile(samples.e2e.clone(), 50),
+        e2e_p95_ms: percentile(samples.e2e, 95),
         output_tokens_per_second: (elapsed_seconds > 0.0)
             .then_some(total_output_tokens as f64 / elapsed_seconds),
         requests_per_second: (elapsed_seconds > 0.0)
@@ -642,6 +855,7 @@ fn build_summary(
 fn summarize(input: &Path) -> Result<(), Box<dyn Error>> {
     let file = File::open(input.join("requests.csv"))?;
     let mut ttft = Vec::new();
+    let mut queue_wait = Vec::new();
     let mut e2e = Vec::new();
     let mut total_output_tokens = 0;
     let mut elapsed_window_ms = 0;
@@ -660,6 +874,9 @@ fn summarize(input: &Path) -> Result<(), Box<dyn Error>> {
         total_output_tokens += columns[3].parse::<usize>()?;
         if let Ok(value) = columns[6].parse() {
             ttft.push(value);
+        }
+        if let Ok(value) = columns[5].parse() {
+            queue_wait.push(value);
         }
         let arrival = columns[4].parse::<u128>()?;
         let request_e2e = columns[7].parse::<u128>()?;
@@ -683,12 +900,130 @@ fn summarize(input: &Path) -> Result<(), Box<dyn Error>> {
         finished_count,
         total_output_tokens,
         elapsed_window_ms,
-        ttft,
-        itl,
-        e2e,
+        SummarySamples {
+            queue_wait,
+            ttft,
+            itl,
+            e2e,
+        },
     );
     write_json(&input.join("summary.json"), &summary)?;
     println!("{}", serde_json::to_string_pretty(&summary)?);
+    Ok(())
+}
+
+fn plot(input: &Path) -> Result<(), Box<dyn Error>> {
+    let file = File::open(input.join("scheduler_steps.csv"))?;
+    let mut samples = Vec::new();
+    for line in BufReader::new(file).lines().skip(1) {
+        let line = line?;
+        let columns = line.split(',').collect::<Vec<_>>();
+        if columns.len() != 16 {
+            return Err(format!("invalid scheduler_steps.csv row: {line}").into());
+        }
+        samples.push((
+            columns[1].parse::<u128>()?,
+            columns[8].parse::<usize>().ok(),
+            columns[10].parse::<u128>().ok(),
+            columns[11].parse::<u128>().ok(),
+            columns[5].parse::<u128>().ok(),
+        ));
+    }
+    if samples.is_empty() {
+        return Err("scheduler_steps.csv contains no samples".into());
+    }
+
+    let left = 70.0;
+    let right = 930.0;
+    let top = 55.0;
+    let bottom = 450.0;
+    let max_time = samples
+        .iter()
+        .map(|sample| sample.0)
+        .max()
+        .unwrap_or(1)
+        .max(1) as f64;
+    let max_chunk = samples
+        .iter()
+        .filter_map(|sample| sample.1)
+        .max()
+        .unwrap_or(1)
+        .max(1) as f64;
+    let max_gap = samples
+        .iter()
+        .flat_map(|sample| [sample.2, sample.3, sample.4])
+        .flatten()
+        .max()
+        .unwrap_or(1)
+        .max(1) as f64;
+    let project = |time: u128, value: f64, maximum: f64| {
+        let x = left + time as f64 / max_time * (right - left);
+        let y = bottom - value / maximum * (bottom - top);
+        format!("{x:.1},{y:.1}")
+    };
+    let chunk_points = samples
+        .iter()
+        .filter_map(|sample| {
+            sample
+                .1
+                .map(|value| project(sample.0, value as f64, max_chunk))
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let gap_points = samples
+        .iter()
+        .filter_map(|sample| {
+            sample
+                .2
+                .map(|value| project(sample.0, value as f64, max_gap))
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let ewma_points = samples
+        .iter()
+        .filter_map(|sample| {
+            sample
+                .3
+                .map(|value| project(sample.0, value as f64, max_gap))
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let wait_points = samples
+        .iter()
+        .filter_map(|sample| {
+            sample
+                .4
+                .map(|value| project(sample.0, value as f64, max_gap))
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let mut output = File::create(input.join("adaptive_trajectory.svg"))?;
+    writeln!(
+        output,
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="520" viewBox="0 0 1000 520">
+<rect width="1000" height="520" fill="#fbfaf7"/>
+<text x="70" y="30" font-family="system-ui" font-size="20" fill="#1d2433">NiniServe scheduler trajectory</text>
+<line x1="70" y1="450" x2="930" y2="450" stroke="#687080"/>
+<line x1="70" y1="55" x2="70" y2="450" stroke="#687080"/>
+<line x1="930" y1="55" x2="930" y2="450" stroke="#687080"/>
+<text x="430" y="495" font-family="system-ui" font-size="14">elapsed time (0–{max_time:.0} ms)</text>
+<text x="10" y="250" font-family="system-ui" font-size="14" transform="rotate(-90 10 250)">chunk tokens (0–{max_chunk:.0})</text>
+<text x="985" y="300" font-family="system-ui" font-size="14" transform="rotate(90 985 300)">gap / wait (0–{max_gap:.0} µs)</text>
+<polyline points="{chunk_points}" fill="none" stroke="#2463eb" stroke-width="2"/>
+<polyline points="{gap_points}" fill="none" stroke="#e05a33" stroke-width="1.5" opacity="0.55"/>
+<polyline points="{ewma_points}" fill="none" stroke="#bf2f64" stroke-width="2.5"/>
+<polyline points="{wait_points}" fill="none" stroke="#15866b" stroke-width="1.5" stroke-dasharray="5 4"/>
+<line x1="90" y1="470" x2="120" y2="470" stroke="#2463eb" stroke-width="2"/><text x="126" y="475" font-family="system-ui" font-size="13">selected chunk</text>
+<line x1="260" y1="470" x2="290" y2="470" stroke="#e05a33" stroke-width="2"/><text x="296" y="475" font-family="system-ui" font-size="13">observed gap</text>
+<line x1="430" y1="470" x2="460" y2="470" stroke="#bf2f64" stroke-width="2.5"/><text x="466" y="475" font-family="system-ui" font-size="13">EWMA gap</text>
+<line x1="590" y1="470" x2="620" y2="470" stroke="#15866b" stroke-width="2" stroke-dasharray="5 4"/><text x="626" y="475" font-family="system-ui" font-size="13">oldest prefill wait</text>
+</svg>"##
+    )?;
+    println!(
+        "plot written to {}",
+        input.join("adaptive_trajectory.svg").display()
+    );
     Ok(())
 }
 
@@ -706,8 +1041,8 @@ fn command_output(program: &str, arguments: &[&str]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, parse_cli, percentile};
-    use niniserve_engine::SchedulerConfig;
+    use super::{Cli, Workload, parse_cli, percentile};
+    use niniserve_engine::{AdaptiveConfig, SchedulerConfig};
 
     #[test]
     fn parses_fixed_chunk_run() {
@@ -739,5 +1074,34 @@ mod tests {
         assert_eq!(percentile(vec![40, 10, 30, 20], 50), Some(20));
         assert_eq!(percentile(vec![40, 10, 30, 20], 95), Some(40));
         assert_eq!(percentile(Vec::new(), 95), None);
+    }
+
+    #[test]
+    fn parses_repeated_adaptive_w5_run() {
+        let arguments = [
+            "run",
+            "--model",
+            "model.gguf",
+            "--scheduler",
+            "adaptive",
+            "--target-itl-ms",
+            "80",
+            "--workload",
+            "W5",
+            "--repeats",
+            "3",
+        ];
+
+        let parsed = parse_cli(arguments.into_iter().map(ToOwned::to_owned)).expect("valid CLI");
+        let Cli::Run(config) = parsed else {
+            panic!("expected run")
+        };
+        let expected = AdaptiveConfig {
+            target_decode_gap_micros: 80_000,
+            ..AdaptiveConfig::default()
+        };
+        assert_eq!(config.scheduler, SchedulerConfig::Adaptive(expected));
+        assert!(matches!(config.workload, Workload::W5));
+        assert_eq!(config.repeats, 3);
     }
 }
