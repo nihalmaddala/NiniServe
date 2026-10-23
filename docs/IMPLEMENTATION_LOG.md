@@ -3,6 +3,165 @@
 This log records verified work, command outcomes, blockers, and the next scoped
 task. It is not a roadmap completion claim.
 
+## 2026-10-23 — Phase 5 commit and PR preparation
+
+User authorized committing the completed drain/report slice and opening a PR
+before the next Phase 5 task. Confirmed the eight intended files, a clean
+whitespace check and formatting check, and the existing implementation-session
+verification below (47 default / 50 all-feature tests; both Clippy gates;
+real-model drain and benchmark/report smoke). No runtime changes were made
+while preparing publication. GitHub authentication works outside the network
+sandbox. Publish this focused branch against main; leave merge and remaining
+Phase 5 admission/burst work for the next step.
+
+## 2026-10-23 — Phase 5 robustness and publishability slice
+
+### Phase and scope
+
+Continue the recorded next task on `feat/phase5-drain-and-reports` after the
+completed Phase 4 gate. This is a partial Phase 5 milestone, not a final v1 gate.
+
+### Plan
+
+1. Add explicit, idempotent engine draining: stop admission atomically, finish
+   accepted command/pending/active work under existing deadlines, release model
+   state, and expose asynchronous completion. Wire Ctrl-C/SIGTERM into drain.
+2. Test active and queued draining, rejection during drain, command/pending
+   overload, slow-consumer cleanup, and HTTP availability behavior with mocks.
+3. Add benchmark manifests with model checksum, context/configuration and source
+   state, plus a report command rebuilt from raw samples, compatible with older
+   artifacts without inventing missing provenance.
+4. Rewrite README with architecture, exact limits/API, all four policies,
+   Phase 4 negative results, setup, verification, and remaining Phase 5 work.
+5. Run formatting, Clippy, workspace/native tests and available real-model smoke;
+   record exact outcomes, limitations, changed files, and the next scoped task.
+
+### Environment audit
+
+Clean working tree at start; macOS arm64, Rust/Cargo 1.97.1, CMake 4.4.4,
+Apple Clang 17. Local Qwen2.5-0.5B-Instruct Q4_K_M GGUF is available (469 MiB).
+No new backend binding calls are planned; all FFI remains in niniserve-backend.
+
+### Results
+
+PASS for this scoped Phase 5 slice. Phase 5 overall and final v1 acceptance
+remain open. No scheduling policy or backend FFI was changed, and no new
+performance improvement is claimed.
+
+### Changed files and behavior
+
+- `crates/niniserve-engine/src/lib.rs`: idempotent `begin_drain()` closes
+  submission under the sender mutex without needing command-queue capacity.
+  Accepted work follows ordinary completion/overload/deadline/disconnect rules;
+  async `drain()` observes backend destruction even while handles remain alive.
+  Command processing per inference iteration is bounded. Request age now starts
+  at submission, including command-queue residence.
+- `crates/niniserve-server/src/main.rs`: Ctrl-C and Unix SIGTERM begin engine
+  draining before Axum finishes serving in-flight responses; wait for backend
+  destruction before normal exit.
+- `crates/niniserve-server/src/lib.rs`: HTTP tests establish 503 before SSE
+  headers on command overload and rejection/readiness behavior during drain.
+- `crates/niniserve-bench/src/main.rs`: new runs reject nonempty output
+  directories and record schema-1 manifests with model/executable/lockfile
+  hashes, source state, actual context limits, configured queues and sampling,
+  prompt fixtures/arrivals, and four raw-input checksums. `report RUN_DIR`
+  verifies checksums and recomputes a Markdown report from CSV samples. Legacy
+  runs are explicitly labeled; malformed nonempty numeric samples now error.
+- `scripts/smoke_drain.py`: optional standard-library Python integration smoke
+  with a supplied local model, configurable port/output directory, two active
+  streams plus one pending request, SIGTERM, terminal SSE and exit checks.
+- `README.md`: complete status/architecture/setup/API/limits/scheduler/benchmark
+  rewrite, with the Phase 4 negative result and remaining Phase 5 work.
+- `docs/BENCHMARKING.md`: manifest schema, checksum/report behavior, legacy
+  provenance, and measurement limitations.
+
+### Deterministic/mock checks
+
+```text
+cargo fmt --all -- --check
+PASS.
+
+cargo clippy --workspace --all-targets -- -D warnings
+PASS.
+
+cargo test --workspace
+PASS — 47 unit tests, 0 failed; doc tests passed (0 tests).
+
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+PASS.
+
+cargo test --workspace --all-features
+PASS — 50 unit tests, 0 failed; doc tests passed (0 tests).
+
+git diff --check
+PASS.
+```
+
+New checks cover in-flight/queued drain, repeated/concurrent drains, backend
+lifetime with retained handles, rejection after drain begins, pending overload,
+slow-consumer abandonment/slot reuse, submission-based deadlines, HTTP overload,
+raw-sample report regeneration, legacy provenance, malformed samples, and
+checksum tampering. One initial full test run exposed a pre-existing race in
+`an_active_request_can_be_cancelled_explicitly`: the fast mock completed before
+cancellation was submitted. Replaced its timing assumption with the existing
+execution gate, then reran the complete default and all-feature gates above.
+
+### Real-model evidence
+
+```text
+cargo build --release -p niniserve-bench -p niniserve-server --features niniserve-server/llamacpp
+PASS.
+
+python3 scripts/smoke_drain.py --model models/qwen2.5-0.5b-instruct-q4_k_m.gguf --output results/phase5/drain-verified-state
+PASS outside sandbox — see server-drain-summary.json and server-drain.log.
+
+target/release/niniserve-bench run --model models/qwen2.5-0.5b-instruct-q4_k_m.gguf --scheduler adaptive --workload W1 --repeats 1 --output results/phase5/adaptive-w1
+PASS outside sandbox — four warmup and 4/4 measured requests completed;
+manifest.json, report.md, metadata.json, summary.json and three raw CSVs written.
+Native output retained in results/phase5/adaptive-w1.log.
+
+target/release/niniserve-bench report results/phase5/adaptive-w1
+PASS — regenerated report after verifying all four input hashes. Independently
+verified SHA-256 hashes with Python hashlib; model hash matches the pinned
+74a4da8c...e7b93d7a9db fixture, and recorded sampling seed is 42.
+
+target/release/niniserve-bench report results/phase4/adaptive-w2
+PASS — legacy CSVs regenerated a report with an explicit absent-manifest notice.
+```
+
+The initial sandboxed server attempt was BLOCKED at Metal initialization
+(`failed to create command queue` / `create llama context: null reference`).
+Authorized execution outside the sandbox passed on Apple M2 with 25/25 layers
+offloaded. The shutdown smoke observed both active requests emit text before
+SIGTERM; both finished 128 fragments, and the queued request finished 16. Each
+returned HTTP 200, finish_reason=length, and [DONE]; process exit was 0 and
+Metal deallocated cleanly. Earlier runs of the same smoke also passed.
+
+The new benchmark is a functional W1 smoke with one measured trial, not another
+policy comparison. The manifest records dirty source and the executable hash;
+its Git revision alone does not reproduce this uncommitted change. Raw results
+and generated reports remain ignored under results/; no weights were added.
+
+### Assumptions, limits, and next task
+
+Draining does not interrupt synchronous backend calls. Existing request
+timeouts are checked at step boundaries; an indefinitely blocked backend or
+slow HTTP transport can delay process exit. A full pending queue is still
+reported as an SSE error after headers; only command-queue overload is rejected
+synchronously with HTTP 503. Scheduler observations retain only 4096 steps.
+Model/backend portability and statistical performance conclusions remain
+limited to recorded hardware/model evidence.
+
+Next session: add capacity-aware admission reservations before SSE headers and
+W4 burst measurements, proving bounded outstanding work and deterministic
+HTTP overload while preserving cleanup and streaming. Prometheus metrics,
+structured tracing, hard HTTP drain bounds, continuous trace export, repeated
+policy automation/variance, and the final public performance report remain.
+
+Suggested commit: `feat: add graceful engine drain and reproducible benchmark reports`.
+Changes are on `feat/phase5-drain-and-reports`; no commit, push, PR, or merge
+has been performed in this session.
+
 ## 2026-10-11 — Issue #14 Phase 4 adaptive-prefill plan
 
 ### Phase and scope

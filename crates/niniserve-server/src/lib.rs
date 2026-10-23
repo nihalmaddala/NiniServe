@@ -499,6 +499,139 @@ mod tests {
         assert!(!body.contains("[DONE]"));
     }
 
+    #[tokio::test]
+    async fn draining_returns_unavailable_for_health_and_new_completions() {
+        let engine = EngineHandle::spawn(
+            MockExecutor::new(BackendLimits {
+                max_batch_tokens: 8,
+                max_active_sequences: 1,
+                max_sequence_tokens: 128,
+            }),
+            EngineConfig {
+                command_capacity: 1,
+                pending_capacity: 1,
+                event_capacity: 8,
+                request_timeout: std::time::Duration::from_secs(30),
+                scheduler: SchedulerConfig::DecodePriority,
+            },
+        );
+        let app = router(
+            engine.clone(),
+            RequestLimits {
+                max_prompt_bytes: 1024,
+                max_new_tokens: 16,
+            },
+        );
+        engine.begin_drain();
+        let health = app
+            .clone()
+            .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let response = app.oneshot(completion_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            !response.headers().contains_key(header::CONTENT_TYPE)
+                || response.headers()[header::CONTENT_TYPE] != "text/event-stream"
+        );
+        engine.drain().await.unwrap();
+    }
+
+    fn completion_request() -> Request<Body> {
+        Request::post("/v1/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"model":"local-gguf","prompt":"A","max_tokens":3,"stream":true}"#,
+            ))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn command_overload_returns_503_before_sse_headers() {
+        use niniserve_protocol::{GenerationRequest, RequestId};
+        use std::sync::{Arc, Mutex};
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let (release, gate) = std::sync::mpsc::channel();
+        let engine = EngineHandle::spawn(
+            GatedExecutor {
+                inner: MockExecutor::new(BackendLimits {
+                    max_batch_tokens: 8,
+                    max_active_sequences: 1,
+                    max_sequence_tokens: 128,
+                }),
+                entered: Arc::clone(&entered),
+                gate: Mutex::new(Some(gate)),
+            },
+            EngineConfig {
+                command_capacity: 1,
+                pending_capacity: 1,
+                event_capacity: 16,
+                request_timeout: std::time::Duration::from_secs(30),
+                scheduler: SchedulerConfig::DecodePriority,
+            },
+        );
+        let request = |id| GenerationRequest {
+            id: RequestId(id),
+            prompt: "A".to_owned(),
+            max_new_tokens: 3,
+            temperature: 0.0,
+            top_p: 1.0,
+            seed: None,
+        };
+        let first = engine.try_generate(request(100)).unwrap();
+        entered.notified().await;
+        let second = engine.try_generate(request(101)).unwrap();
+        let response = router(
+            engine.clone(),
+            RequestLimits {
+                max_prompt_bytes: 1024,
+                max_new_tokens: 16,
+            },
+        )
+        .oneshot(completion_request())
+        .await
+        .unwrap();
+        drop(first);
+        drop(second);
+        release.send(()).unwrap();
+        engine.drain().await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            to_bytes(response.into_body(), 1024).await.unwrap(),
+            r#"{"error":"engine command queue is full"}"#
+        );
+    }
+
+    struct GatedExecutor {
+        inner: MockExecutor,
+        entered: std::sync::Arc<tokio::sync::Notify>,
+        gate: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    impl ModelExecutor for GatedExecutor {
+        fn tokenize(&self, prompt: &str) -> Result<Vec<u32>, BackendError> {
+            if let Some(gate) = self.gate.lock().unwrap().take() {
+                self.entered.notify_one();
+                gate.recv().unwrap();
+            }
+            self.inner.tokenize(prompt)
+        }
+        fn execute(
+            &mut self,
+            plan: &ExecutionPlan,
+        ) -> Result<Vec<BackendTokenEvent>, BackendError> {
+            self.inner.execute(plan)
+        }
+        fn release_sequence(&mut self, id: SequenceId) -> Result<(), BackendError> {
+            self.inner.release_sequence(id)
+        }
+        fn limits(&self) -> BackendLimits {
+            self.inner.limits()
+        }
+    }
+
     struct FailingExecutor;
 
     impl ModelExecutor for FailingExecutor {

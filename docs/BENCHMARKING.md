@@ -144,3 +144,51 @@ backend calls are non-preemptive, checks happen at step boundaries, and pending
 requests outside the four active sequence slots cannot receive scheduler work.
 The implementation log contains the complete table and counts; ignored raw
 artifacts remain in `results/phase4/`.
+
+## Phase 5 manifests and reports
+
+New `run` invocations require an empty output directory and automatically write
+`manifest.json` and `report.md` alongside the existing raw files. Hashing happens
+outside the inference measurement window and requires `shasum` (macOS) or
+`sha256sum` (Linux). The model is streamed through the checksum utility rather
+than read into an additional in-process model-sized buffer.
+
+The schema-1 manifest records:
+
+- Model, running executable, and Cargo.lock SHA-256 hashes.
+- Git revision and working-tree dirtiness observed at run startup. A dirty
+  revision alone cannot reproduce local edits; retain the reviewed source or
+  run from a clean commit for a published comparison.
+- Actual context/batch limits, configured sequence count, requested GPU layers,
+  and whether GPU offload is supported. Actual layer placement still requires
+  the native backend log; capability is not proof of placement.
+- Engine queue capacities/deadline, greedy sampling with seed 42, scheduler
+  configuration, repeat count, exact prompt fixtures, tokenizer counts, and
+  planned arrivals. Measured arrivals remain in requests.csv.
+- SHA-256 hashes of metadata.json, requests.csv, token_gaps.csv, and
+  scheduler_steps.csv. Hashes detect modifications relative to the manifest;
+  they do not authenticate the measurements or prove experiment correctness.
+
+Regenerate a report without loading a model:
+
+```bash
+target/release/niniserve-bench report results/adaptive-w5
+```
+
+The command verifies the four input hashes when a manifest exists, recomputes
+summary values from raw CSV samples, and writes a Markdown report. Invalid
+nonempty numeric samples and invalid completion booleans are rejected instead
+of silently omitted. The report does not modify raw inputs or summary.json;
+`summary RUN_DIR` remains the explicit summary-regeneration command.
+
+Older Phase 3/4 directories still work. Their reports state that manifest
+provenance is missing, without filling in hashes, context settings, or source
+state from today's environment. Reports include engine-level measurement limits
+and avoid inferring statistical significance or adaptive superiority.
+
+The harness directly consumes engine events rather than HTTP. Its elapsed
+measurements include engine event delivery overhead but exclude HTTP/network
+transport. Scheduler observations are a bounded tail of at most 4096 steps;
+long experiments can lose early trace data. W4 overload measurements, continuous
+trace export, automated policy matrices, variance analysis, and a final public
+performance report remain Phase 5 work.

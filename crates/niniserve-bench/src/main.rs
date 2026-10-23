@@ -21,12 +21,14 @@ use niniserve_protocol::{FinishReason, GenerationEvent, GenerationRequest, Reque
 use serde::Serialize;
 
 const BACKEND_VERSION: &str = "llama-cpp-2 0.1.159";
+const BENCHMARK_SEED: u64 = 42;
 
 #[derive(Debug)]
 enum Cli {
     Run(RunConfig),
     Summary(PathBuf),
     Plot(PathBuf),
+    Report(PathBuf),
 }
 
 #[derive(Debug)]
@@ -171,6 +173,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Cli::Run(config) => run(config).await,
         Cli::Summary(input) => summarize(&input),
         Cli::Plot(input) => plot(&input),
+        Cli::Report(input) => report(&input),
     }
 }
 
@@ -318,8 +321,9 @@ fn parse_cli(mut arguments: impl Iterator<Item = String>) -> Result<Cli, String>
             &mut arguments,
             "summary",
         )?))),
+        Some("report") => Ok(Cli::Report(PathBuf::from(next(&mut arguments, "report")?))),
         Some("plot") => Ok(Cli::Plot(PathBuf::from(next(&mut arguments, "plot")?))),
-        _ => Err("usage: niniserve-bench run --model MODEL.gguf --scheduler POLICY --workload W0|W1|W2|W3|W5 [--repeats N] [--output DIR] | summary RUN_DIR | plot RUN_DIR".to_owned()),
+        _ => Err("usage: niniserve-bench run --model MODEL.gguf --scheduler POLICY --workload W0|W1|W2|W3|W5 [--repeats N] [--output DIR] | summary RUN_DIR | plot RUN_DIR | report RUN_DIR".to_owned()),
     }
 }
 
@@ -372,7 +376,15 @@ async fn run(config: RunConfig) -> Result<(), Box<dyn Error>> {
         .output
         .unwrap_or_else(|| PathBuf::from("results").join(&run_id));
     fs::create_dir_all(&output)?;
+    if fs::read_dir(&output)?.next().is_some() {
+        return Err(format!("output directory is not empty: {}", output.display()).into());
+    }
 
+    let git_commit = command_output("git", &["rev-parse", "HEAD"]);
+    let git_status = command_output("git", &["status", "--porcelain"]);
+    let cargo_lock_sha256 = file_sha256(Path::new("Cargo.lock"))?;
+    let model_sha256 = file_sha256(&config.model)?;
+    let executable_sha256 = file_sha256(&env::current_exe()?)?;
     let backend_config = LlamaCppConfig {
         model_path: config.model.clone(),
         n_ctx: 8_192,
@@ -384,8 +396,13 @@ async fn run(config: RunConfig) -> Result<(), Box<dyn Error>> {
     let load_started = Instant::now();
     let executor = LlamaCppExecutor::load(&backend_config)?;
     let model_load_ms = load_started.elapsed().as_millis();
+    let context_limits = executor.context_limits();
+    let gpu_offload_supported = executor.gpu_offload_supported();
     let requests = workload_requests(config.workload, &executor)?;
-    let measured_requests = requests.len() * config.repeats;
+    let measured_requests = requests
+        .len()
+        .checked_mul(config.repeats)
+        .ok_or("measured request count overflow")?;
     let engine = EngineHandle::spawn(
         executor,
         EngineConfig {
@@ -435,7 +452,7 @@ async fn run(config: RunConfig) -> Result<(), Box<dyn Error>> {
     let steps = engine.take_step_observations();
     let metadata = Metadata {
         run_id: &run_id,
-        git_commit: command_output("git", &["rev-parse", "HEAD"]),
+        git_commit,
         model_name: config.model.file_name().map_or_else(
             || config.model.display().to_string(),
             |name| name.to_string_lossy().into_owned(),
@@ -458,6 +475,43 @@ async fn run(config: RunConfig) -> Result<(), Box<dyn Error>> {
     write_steps(&output.join("scheduler_steps.csv"), &steps)?;
     let summary = summary_from_results(&results);
     write_json(&output.join("summary.json"), &summary)?;
+    let mut artifacts = serde_json::Map::new();
+    for name in REPORT_INPUTS {
+        artifacts.insert(name.to_owned(), file_sha256(&output.join(name))?.into());
+    }
+    let manifest = serde_json::json!({
+        "schema_version": 1,
+        "metadata": metadata,
+        "model_sha256": model_sha256,
+        "executable_sha256": executable_sha256,
+        "cargo_lock_sha256": cargo_lock_sha256,
+        "git_dirty": if git_status == "unavailable" { None } else { Some(!git_status.is_empty()) },
+        "command_arguments": env::args().skip(1).collect::<Vec<_>>(),
+        "context": {
+            "n_ctx": context_limits.0,
+            "n_ctx_seq": context_limits.0 / backend_config.n_seq_max,
+            "n_batch": context_limits.1,
+            "n_ubatch": context_limits.2,
+            "n_seq_max": backend_config.n_seq_max,
+            "requested_gpu_layers": backend_config.gpu_layers,
+            "gpu_offload_supported": gpu_offload_supported,
+        },
+        "sampling": { "temperature": 0.0, "top_p": 1.0, "seed": BENCHMARK_SEED },
+        "engine": { "command_capacity": 32, "pending_capacity": 32,
+            "event_capacity": 256, "request_timeout_seconds": 180 },
+        "workload_requests_per_trial": requests.iter().map(|request| serde_json::json!({
+            "request_id": request.id.0,
+            "prompt": request.prompt,
+            "prompt_tokens": request.prompt_tokens,
+            "max_new_tokens": request.max_new_tokens,
+            "arrival_delay_ms": request.arrival_delay_ms,
+        })).collect::<Vec<_>>(),
+        "artifacts_sha256": artifacts,
+        "limitations": "Engine-level measurements, not HTTP/network latency. One host/model; no confidence intervals. Dirty source cannot be reproduced from commit alone. Requested GPU offload does not prove actual layer placement. Scheduler observations retain only the latest 4096 steps."
+    });
+    write_json(&output.join("manifest.json"), &manifest)?;
+    report(&output)?;
+    engine.drain().await?;
     println!("results written to {}", output.display());
     println!("{}", serde_json::to_string_pretty(&summary)?);
     Ok(())
@@ -517,7 +571,7 @@ async fn measure_request(
             max_new_tokens: spec.max_new_tokens,
             temperature: 0.0,
             top_p: 1.0,
-            seed: Some(42),
+            seed: Some(BENCHMARK_SEED),
         })
         .map_err(|error| error.to_string())?;
     let mut queue_wait_ms = None;
@@ -852,7 +906,7 @@ fn build_summary(
     }
 }
 
-fn summarize(input: &Path) -> Result<(), Box<dyn Error>> {
+fn read_summary(input: &Path) -> Result<Summary, Box<dyn Error>> {
     let file = File::open(input.join("requests.csv"))?;
     let mut ttft = Vec::new();
     let mut queue_wait = Vec::new();
@@ -868,19 +922,23 @@ fn summarize(input: &Path) -> Result<(), Box<dyn Error>> {
             return Err(format!("invalid requests.csv row: {line}").into());
         }
         request_count += 1;
-        if columns[8] == "true" {
+        if columns[8].parse::<bool>()? {
             finished_count += 1;
         }
         total_output_tokens += columns[3].parse::<usize>()?;
-        if let Ok(value) = columns[6].parse() {
-            ttft.push(value);
+        if !columns[6].is_empty() {
+            ttft.push(columns[6].parse()?);
         }
-        if let Ok(value) = columns[5].parse() {
-            queue_wait.push(value);
+        if !columns[5].is_empty() {
+            queue_wait.push(columns[5].parse()?);
         }
         let arrival = columns[4].parse::<u128>()?;
         let request_e2e = columns[7].parse::<u128>()?;
-        elapsed_window_ms = elapsed_window_ms.max(arrival + request_e2e);
+        elapsed_window_ms = elapsed_window_ms.max(
+            arrival
+                .checked_add(request_e2e)
+                .ok_or("request end time overflow")?,
+        );
         e2e.push(request_e2e);
     }
     let gaps = File::open(input.join("token_gaps.csv"))?;
@@ -891,8 +949,8 @@ fn summarize(input: &Path) -> Result<(), Box<dyn Error>> {
         if columns.len() != 4 {
             return Err(format!("invalid token_gaps.csv row: {line}").into());
         }
-        if let Ok(value) = columns[3].parse() {
-            itl.push(value);
+        if !columns[3].is_empty() {
+            itl.push(columns[3].parse()?);
         }
     }
     let summary = build_summary(
@@ -907,6 +965,11 @@ fn summarize(input: &Path) -> Result<(), Box<dyn Error>> {
             e2e,
         },
     );
+    Ok(summary)
+}
+
+fn summarize(input: &Path) -> Result<(), Box<dyn Error>> {
+    let summary = read_summary(input)?;
     write_json(&input.join("summary.json"), &summary)?;
     println!("{}", serde_json::to_string_pretty(&summary)?);
     Ok(())
@@ -1027,6 +1090,103 @@ fn plot(input: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+const REPORT_INPUTS: [&str; 4] = [
+    "metadata.json",
+    "requests.csv",
+    "token_gaps.csv",
+    "scheduler_steps.csv",
+];
+
+fn file_sha256(path: &Path) -> Result<String, Box<dyn Error>> {
+    // Use the platform's checksum utility rather than loading a GGUF into RAM.
+    for (program, flags) in [("shasum", &["-a", "256"][..]), ("sha256sum", &[][..])] {
+        let output = Command::new(program).args(flags).arg(path).output();
+        if let Ok(output) = output
+            && output.status.success()
+        {
+            let digest = String::from_utf8(output.stdout)?
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_owned();
+            if digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Ok(digest);
+            }
+        }
+    }
+    Err(format!(
+        "cannot SHA-256 {}; install shasum or sha256sum and check file access",
+        path.display()
+    )
+    .into())
+}
+
+fn report(input: &Path) -> Result<(), Box<dyn Error>> {
+    let metadata: serde_json::Value =
+        serde_json::from_reader(File::open(input.join("metadata.json"))?)?;
+    let manifest_path = input.join("manifest.json");
+    let (provenance, manifest) = if manifest_path.try_exists()? {
+        let manifest: serde_json::Value = serde_json::from_reader(File::open(manifest_path)?)?;
+        if manifest["schema_version"] != 1 {
+            return Err("unsupported benchmark manifest schema".into());
+        }
+        for name in REPORT_INPUTS {
+            let expected = manifest["artifacts_sha256"][name]
+                .as_str()
+                .ok_or_else(|| format!("manifest lacks checksum for {name}"))?;
+            if file_sha256(&input.join(name))? != expected {
+                return Err(format!("artifact checksum mismatch: {name}").into());
+            }
+        }
+        (
+            "Recorded input checksums verified against manifest.json. Checksums detect changes; they do not authenticate the experiment.",
+            Some(manifest),
+        )
+    } else {
+        (
+            "Legacy run: no manifest.json. Model checksum, context settings, source dirtiness, and artifact integrity were not recorded here; do not infer them from the current machine.",
+            None,
+        )
+    };
+    let summary = read_summary(input)?;
+    let metric = |value: Option<u128>| value.map_or_else(|| "n/a".to_owned(), |v| v.to_string());
+    let mut text = format!(
+        "# NiniServe benchmark report\n\n{provenance}\n\n\
+         | Metric | Value |\n| --- | ---: |\n\
+         | Requests | {} |\n| Completed | {} |\n| Failed | {} |\n\
+         | TTFT p50 / p95 (ms) | {} / {} |\n\
+         | ITL p50 / p95 (ms) | {} / {} |\n\
+         | Queue wait p95 / max (ms) | {} / {} |\n\
+         | Output tokens/s | {} |\n\n\
+         ## Recorded metadata\n\n```json\n{}\n```\n\n\
+         ## Recomputed summary\n\n```json\n{}\n```\n\n",
+        summary.request_count,
+        summary.finished_count,
+        summary.failed_count,
+        metric(summary.ttft_p50_ms),
+        metric(summary.ttft_p95_ms),
+        metric(summary.itl_p50_ms),
+        metric(summary.itl_p95_ms),
+        metric(summary.queue_wait_p95_ms),
+        metric(summary.queue_wait_max_ms),
+        summary
+            .output_tokens_per_second
+            .map_or_else(|| "n/a".to_owned(), |v| format!("{v:.2}")),
+        serde_json::to_string_pretty(&metadata)?,
+        serde_json::to_string_pretty(&summary)?,
+    );
+    if let Some(manifest) = manifest {
+        text.push_str(&format!(
+            "## Recorded manifest\n\n```json\n{}\n```\n\n",
+            serde_json::to_string_pretty(&manifest)?
+        ));
+    }
+    text.push_str("## Measurement limits\n\nThese are engine-level token-ready timings; HTTP/network delivery is excluded. Model load and workload-shaped warmup are excluded from the measured window. Percentiles use nearest rank over pooled samples; repeats are not confidence intervals. Results apply only to the recorded hardware, model, and workload. This report makes no adaptive superiority claim. Scheduler traces retain at most the last 4096 steps.\n");
+    fs::write(input.join("report.md"), text)?;
+    println!("report written to {}", input.join("report.md").display());
+    Ok(())
+}
+
 fn command_output(program: &str, arguments: &[&str]) -> String {
     Command::new(program)
         .args(arguments)
@@ -1043,6 +1203,107 @@ fn command_output(program: &str, arguments: &[&str]) -> String {
 mod tests {
     use super::{Cli, Workload, parse_cli, percentile};
     use niniserve_engine::{AdaptiveConfig, SchedulerConfig};
+
+    struct Fixture(std::path::PathBuf);
+
+    impl Fixture {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "niniserve-report-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).unwrap();
+            std::fs::write(
+                path.join("metadata.json"),
+                r#"{"run_id":"synthetic-test","hardware":"fixture","scheduler":"fixed-chunk"}"#,
+            )
+            .unwrap();
+            std::fs::write(path.join("requests.csv"), "request_id,policy,prompt_tokens,output_tokens,arrival_ms,queue_wait_ms,ttft_ms,e2e_ms,finished,finish_reason\n1,fixed-chunk,2,2,0,1,10,30,true,length\n2,fixed-chunk,2,0,5,,,10,false,timeout\n").unwrap();
+            std::fs::write(
+                path.join("token_gaps.csv"),
+                "request_id,token_index,ready_at_ms,itl_ms\n1,0,10,\n1,1,30,20\n",
+            )
+            .unwrap();
+            std::fs::write(
+                path.join("scheduler_steps.csv"),
+                "engine_step,timestamp_ms\n0,10\n",
+            )
+            .unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn report_recomputes_samples_and_marks_legacy_provenance() {
+        let fixture = Fixture::new();
+        let summary = super::read_summary(&fixture.0).unwrap();
+        assert_eq!(summary.request_count, 2);
+        assert_eq!(summary.finished_count, 1);
+        assert_eq!(summary.failed_count, 1);
+        assert_eq!(summary.ttft_p95_ms, Some(10));
+        assert_eq!(summary.itl_p95_ms, Some(20));
+        assert_eq!(summary.elapsed_window_ms, 30);
+        super::report(&fixture.0).unwrap();
+        let text = std::fs::read_to_string(fixture.0.join("report.md")).unwrap();
+        assert!(text.contains("Legacy run: no manifest.json"));
+        assert!(text.contains("| Completed | 1 |"));
+        // A report must not silently rewrite the raw input or summary artifacts.
+        assert!(!fixture.0.join("summary.json").exists());
+    }
+
+    #[test]
+    fn report_verifies_manifest_and_rejects_modified_samples() {
+        let fixture = Fixture::new();
+        let mut hashes = serde_json::Map::new();
+        for name in super::REPORT_INPUTS {
+            hashes.insert(
+                name.to_owned(),
+                super::file_sha256(&fixture.0.join(name)).unwrap().into(),
+            );
+        }
+        super::write_json(
+            &fixture.0.join("manifest.json"),
+            &serde_json::json!({
+                "schema_version": 1, "artifacts_sha256": hashes,
+            }),
+        )
+        .unwrap();
+        super::report(&fixture.0).unwrap();
+        let report_before = std::fs::read(fixture.0.join("report.md")).unwrap();
+        std::fs::write(fixture.0.join("token_gaps.csv"), "corrupt").unwrap();
+        let error = super::report(&fixture.0).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("artifact checksum mismatch: token_gaps.csv")
+        );
+        assert_eq!(
+            std::fs::read(fixture.0.join("report.md")).unwrap(),
+            report_before
+        );
+    }
+
+    #[test]
+    fn malformed_optional_measurements_are_errors_instead_of_missing_samples() {
+        let fixture = Fixture::new();
+        let path = fixture.0.join("requests.csv");
+        let text = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace(",1,10,30,true", ",1,garbage,30,true");
+        std::fs::write(path, text).unwrap();
+        assert!(super::read_summary(&fixture.0).is_err());
+        assert!(matches!(
+            parse_cli(["report", "results/run"].into_iter().map(ToOwned::to_owned)).unwrap(),
+            Cli::Report(_)
+        ));
+    }
 
     #[test]
     fn parses_fixed_chunk_run() {

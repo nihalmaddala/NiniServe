@@ -19,7 +19,7 @@ use niniserve_scheduler::{
     ConfiguredScheduler, EngineView, Scheduler, SequencePhase, SequenceSnapshot, StepBudget,
     WorkKind,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 pub use niniserve_scheduler::{AdaptiveConfig, SchedulerConfig};
 
@@ -63,6 +63,8 @@ pub struct EngineHandle {
 struct EngineInner {
     commands: Mutex<Option<mpsc::Sender<EngineCommand>>>,
     ready: Arc<AtomicBool>,
+    draining: Arc<AtomicBool>,
+    stopped: watch::Receiver<bool>,
     event_capacity: usize,
     worker: Mutex<Option<thread::JoinHandle<()>>>,
     observations: Arc<Mutex<VecDeque<EngineStepObservation>>>,
@@ -100,6 +102,9 @@ impl EngineHandle {
         let (commands, receiver) = mpsc::channel(config.command_capacity);
         let ready = Arc::new(AtomicBool::new(false));
         let worker_ready = Arc::clone(&ready);
+        let draining = Arc::new(AtomicBool::new(false));
+        let worker_draining = Arc::clone(&draining);
+        let (stopped, wait_for_stop) = watch::channel(false);
         let (started, wait_for_start) = std::sync::mpsc::sync_channel(0);
         let observations = Arc::new(Mutex::new(VecDeque::with_capacity(RECENT_STEP_CAPACITY)));
         let worker_observations = Arc::clone(&observations);
@@ -116,8 +121,10 @@ impl EngineHandle {
                 );
                 worker_ready.store(true, Ordering::Release);
                 let _ = started.send(());
-                runtime.run();
+                runtime.run(&worker_draining);
                 worker_ready.store(false, Ordering::Release);
+                drop(runtime);
+                let _ = stopped.send(true);
             })
             .expect("failed to spawn the engine worker thread");
         wait_for_start
@@ -127,6 +134,8 @@ impl EngineHandle {
             inner: Arc::new(EngineInner {
                 commands: Mutex::new(Some(commands)),
                 ready,
+                draining,
+                stopped: wait_for_stop,
                 event_capacity: config.event_capacity,
                 worker: Mutex::new(Some(worker)),
                 observations,
@@ -139,6 +148,32 @@ impl EngineHandle {
         self.inner.ready.load(Ordering::Acquire)
     }
 
+    /// Stops new submissions while preserving all accepted work and deadlines.
+    /// Closing the sender also wakes an idle worker without a queue slot.
+    pub fn begin_drain(&self) {
+        let mut commands = self
+            .inner
+            .commands
+            .lock()
+            .expect("engine command mutex poisoned");
+        self.inner.draining.store(true, Ordering::Release);
+        self.inner.ready.store(false, Ordering::Release);
+        commands.take();
+    }
+
+    /// Waits without blocking an async worker until accepted work and backend
+    /// destruction finish. Backend calls remain non-preemptive.
+    pub async fn drain(&self) -> Result<(), EngineSubmitError> {
+        self.begin_drain();
+        self.inner
+            .stopped
+            .clone()
+            .wait_for(|stopped| *stopped)
+            .await
+            .map(|_| ())
+            .map_err(|_| EngineSubmitError::Stopped)
+    }
+
     pub fn try_generate(
         &self,
         request: GenerationRequest,
@@ -148,7 +183,11 @@ impl EngineHandle {
         }
         let request_id = request.id;
         let (events, receiver) = mpsc::channel(self.inner.event_capacity);
-        self.try_send(EngineCommand::Generate { request, events })?;
+        self.try_send(EngineCommand::Generate {
+            request,
+            events,
+            enqueued_at: Instant::now(),
+        })?;
         Ok(GenerationStream {
             request_id,
             events: receiver,
@@ -257,6 +296,7 @@ enum EngineCommand {
     Generate {
         request: GenerationRequest,
         events: mpsc::Sender<GenerationEvent>,
+        enqueued_at: Instant,
     },
     Cancel {
         request_id: RequestId,
@@ -315,7 +355,7 @@ impl<E: ModelExecutor> EngineRuntime<E> {
         }
     }
 
-    fn run(&mut self) {
+    fn run(&mut self, draining: &AtomicBool) {
         loop {
             if self.active.is_empty() && self.pending.is_empty() {
                 let Some(command) = self.commands.blocking_recv() else {
@@ -324,7 +364,9 @@ impl<E: ModelExecutor> EngineRuntime<E> {
                 self.handle_command(command);
             }
             let mut channel_closed = false;
-            loop {
+            // Bound control work so continuous submissions cannot indefinitely
+            // postpone inference, cancellation checks, or request deadlines.
+            for _ in 0..self.commands.max_capacity() {
                 match self.commands.try_recv() {
                     Ok(command) => self.handle_command(command),
                     Err(mpsc::error::TryRecvError::Empty) => break,
@@ -336,7 +378,7 @@ impl<E: ModelExecutor> EngineRuntime<E> {
             }
             self.cancel_disconnected();
             self.expire_requests();
-            if channel_closed {
+            if channel_closed && !draining.load(Ordering::Acquire) {
                 self.cancel_everything();
                 break;
             }
@@ -349,7 +391,11 @@ impl<E: ModelExecutor> EngineRuntime<E> {
 
     fn handle_command(&mut self, command: EngineCommand) {
         match command {
-            EngineCommand::Generate { request, events } => {
+            EngineCommand::Generate {
+                request,
+                events,
+                enqueued_at,
+            } => {
                 if self.pending.len() >= self.pending_capacity {
                     let _ = events.try_send(GenerationEvent::Error {
                         request_id: request.id,
@@ -361,7 +407,7 @@ impl<E: ModelExecutor> EngineRuntime<E> {
                     self.pending.push_back(PendingRequest {
                         request,
                         events,
-                        enqueued_at: Instant::now(),
+                        enqueued_at,
                         admission_order,
                     });
                 }
@@ -1083,6 +1129,182 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn drain_finishes_active_and_command_queued_work_and_rejects_new_work() {
+        let execute_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let executor = RecordingGateExecutor {
+            inner: MockExecutor::new(BackendLimits {
+                max_batch_tokens: 8,
+                max_active_sequences: 1,
+                max_sequence_tokens: 128,
+            }),
+            plans: Arc::new(Mutex::new(Vec::new())),
+            gate: Arc::new((Mutex::new(true), Condvar::new())),
+            first_tokenize: AtomicBool::new(true),
+            tokenize_entered: Arc::new(AtomicBool::new(false)),
+            execute_gate: Some(Arc::clone(&execute_gate)),
+            first_execute: AtomicBool::new(true),
+        };
+        let engine = EngineHandle::spawn(executor, config());
+        let mut first = engine.try_generate(request(70)).unwrap();
+        let started = first.recv().await;
+        let second = engine.try_generate(request(71)).unwrap();
+        engine.begin_drain();
+        engine.begin_drain();
+        let ready = engine.is_ready();
+        let rejected = engine.try_generate(request(72));
+        let (open, wake) = &*execute_gate;
+        *open.lock().unwrap() = true;
+        wake.notify_one();
+
+        assert!(matches!(started, Some(GenerationEvent::Started { .. })));
+        assert!(!ready);
+        assert!(matches!(rejected, Err(super::EngineSubmitError::NotReady)));
+        let (first, second, drained) = tokio::join!(
+            collect_stream(first),
+            collect_stream(second),
+            engine.drain()
+        );
+        drained.unwrap();
+        for events in [first, second] {
+            assert_eq!(events.iter().filter(|event| event.is_terminal()).count(), 1);
+            assert!(matches!(
+                events.last(),
+                Some(GenerationEvent::Completed { .. })
+            ));
+        }
+        engine.drain().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_drain_drops_the_backend_even_while_handles_are_retained() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let engine = EngineHandle::spawn(
+            DropTrackingExecutor {
+                inner: MockExecutor::new(BackendLimits {
+                    max_batch_tokens: 8,
+                    max_active_sequences: 1,
+                    max_sequence_tokens: 128,
+                }),
+                dropped: Arc::clone(&dropped),
+            },
+            config(),
+        );
+        let clone = engine.clone();
+        let (first, second) = tokio::join!(engine.drain(), clone.drain());
+        first.unwrap();
+        second.unwrap();
+        assert!(dropped.load(Ordering::Acquire));
+        assert!(!clone.is_ready());
+    }
+
+    #[test]
+    fn pending_overload_sheds_only_excess_work_and_slow_output_releases_capacity() {
+        use super::{EngineCommand, EngineRuntime};
+        use std::collections::VecDeque;
+        use std::time::Instant;
+        use tokio::sync::mpsc;
+
+        let (_commands, receiver) = mpsc::channel(4);
+        let mut runtime = EngineRuntime::new(
+            MockExecutor::new(BackendLimits {
+                max_batch_tokens: 8,
+                max_active_sequences: 1,
+                max_sequence_tokens: 128,
+            }),
+            receiver,
+            1,
+            Duration::from_secs(30),
+            SchedulerConfig::DecodePriority,
+            Arc::new(Mutex::new(VecDeque::new())),
+        );
+        let (slow, mut slow_events) = mpsc::channel(1);
+        runtime.handle_command(EngineCommand::Generate {
+            request: request(80),
+            events: slow,
+            enqueued_at: Instant::now(),
+        });
+        let (excess, mut excess_events) = mpsc::channel(1);
+        runtime.handle_command(EngineCommand::Generate {
+            request: request(81),
+            events: excess,
+            enqueued_at: Instant::now(),
+        });
+        assert!(matches!(excess_events.try_recv().unwrap(),
+            GenerationEvent::Error { request_id: RequestId(81), message }
+            if message.contains("pending queue is full")));
+        assert_eq!(runtime.pending.len(), 1);
+        runtime.admit_pending();
+        // Started fills the unread channel; the first token must abandon this
+        // request rather than blocking the sole model owner.
+        runtime.execute_step();
+        assert!(runtime.active.is_empty());
+        assert_eq!(runtime.free_slots, vec![SequenceId(0)]);
+        assert_eq!(runtime.executor.active_sequence_count(), 0);
+        assert!(matches!(
+            slow_events.try_recv().unwrap(),
+            GenerationEvent::Started { .. }
+        ));
+        assert!(slow_events.try_recv().is_err());
+
+        let (events, mut received) = mpsc::channel(16);
+        runtime.handle_command(EngineCommand::Generate {
+            request: request(82),
+            events,
+            enqueued_at: Instant::now(),
+        });
+        runtime.admit_pending();
+        while !runtime.active.is_empty() {
+            runtime.execute_step();
+        }
+        let mut terminal = None;
+        while let Ok(event) = received.try_recv() {
+            if event.is_terminal() {
+                terminal = Some(event);
+            }
+        }
+        assert!(matches!(terminal, Some(GenerationEvent::Completed { .. })));
+        assert_eq!(runtime.executor.active_sequence_count(), 0);
+    }
+
+    #[test]
+    fn command_queue_time_counts_toward_the_request_deadline() {
+        use super::{EngineCommand, EngineRuntime};
+        use std::collections::VecDeque;
+        use std::time::Instant;
+        use tokio::sync::mpsc;
+
+        let (_commands, receiver) = mpsc::channel(1);
+        let mut runtime = EngineRuntime::new(
+            MockExecutor::new(BackendLimits {
+                max_batch_tokens: 8,
+                max_active_sequences: 1,
+                max_sequence_tokens: 128,
+            }),
+            receiver,
+            1,
+            Duration::from_secs(1),
+            SchedulerConfig::DecodePriority,
+            Arc::new(Mutex::new(VecDeque::new())),
+        );
+        let (events, mut received) = mpsc::channel(4);
+        runtime.handle_command(EngineCommand::Generate {
+            request: request(83),
+            events,
+            enqueued_at: Instant::now() - Duration::from_secs(2),
+        });
+        runtime.expire_requests();
+        runtime.admit_pending();
+        assert_eq!(
+            received.try_recv().unwrap(),
+            GenerationEvent::TimedOut {
+                request_id: RequestId(83)
+            }
+        );
+        assert!(runtime.active.is_empty());
+        assert_eq!(runtime.executor.active_sequence_count(), 0);
+    }
+
+    #[tokio::test]
     async fn concurrent_requests_share_batches_without_mixing_outputs() {
         let plans = Arc::new(Mutex::new(Vec::<Vec<BatchToken>>::new()));
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
@@ -1450,26 +1672,38 @@ mod tests {
 
     #[tokio::test]
     async fn an_active_request_can_be_cancelled_explicitly() {
+        let execute_gate = Arc::new((Mutex::new(false), Condvar::new()));
         let engine = EngineHandle::spawn(
-            MockExecutor::new(BackendLimits {
-                max_batch_tokens: 8,
-                max_active_sequences: 1,
-                max_sequence_tokens: 128,
-            }),
+            RecordingGateExecutor {
+                inner: MockExecutor::new(BackendLimits {
+                    max_batch_tokens: 8,
+                    max_active_sequences: 1,
+                    max_sequence_tokens: 128,
+                }),
+                plans: Arc::new(Mutex::new(Vec::new())),
+                gate: Arc::new((Mutex::new(true), Condvar::new())),
+                first_tokenize: AtomicBool::new(true),
+                tokenize_entered: Arc::new(AtomicBool::new(false)),
+                execute_gate: Some(Arc::clone(&execute_gate)),
+                first_execute: AtomicBool::new(true),
+            },
             config(),
         );
         let mut input = request(20);
         input.max_new_tokens = 100;
         let mut events = engine.try_generate(input).expect("request is admitted");
+        let started = events.recv().await;
+        let cancelled = engine.try_cancel(RequestId(20));
+        let (open, wake) = &*execute_gate;
+        *open.lock().unwrap() = true;
+        wake.notify_one();
         assert_eq!(
-            events.recv().await,
+            started,
             Some(GenerationEvent::Started {
                 request_id: RequestId(20)
             })
         );
-        engine
-            .try_cancel(RequestId(20))
-            .expect("cancellation enters queue");
+        cancelled.expect("cancellation enters queue");
         let mut terminal = None;
         while let Some(event) = events.recv().await {
             if event.is_terminal() {
