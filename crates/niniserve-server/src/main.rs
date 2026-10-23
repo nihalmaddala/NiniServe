@@ -230,7 +230,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         },
     );
     let app = router(
-        engine,
+        engine.clone(),
         RequestLimits {
             max_prompt_bytes: 16 * 1_024,
             max_new_tokens: 256,
@@ -248,13 +248,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
         backend_config.n_seq_max
     );
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown_signal(engine.clone()))
         .await?;
+    engine.drain().await?;
     Ok(())
 }
 
-async fn shutdown_signal() {
+async fn shutdown_signal(engine: EngineHandle) {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("failed to install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = terminate.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
     let _ = tokio::signal::ctrl_c().await;
+    engine.begin_drain();
 }
 
 #[cfg(test)]
